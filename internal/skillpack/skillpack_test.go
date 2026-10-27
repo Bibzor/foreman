@@ -389,7 +389,13 @@ func TestInstallRefusesSymlinks(t *testing.T) {
 					t.Errorf("outside file = %q, want unchanged", got)
 				}
 			}
+			if fi, err := os.Lstat(filepath.Join(target, tt.link)); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+				t.Errorf("%s is no longer a symlink (err = %v)", tt.link, err)
+			}
 			for _, p := range []string{lockPath, betaPath} {
+				if p == tt.link {
+					continue
+				}
 				if _, err := os.Lstat(filepath.Join(target, p)); !errors.Is(err, os.ErrNotExist) {
 					t.Errorf("%s was written despite the refusal", p)
 				}
