@@ -1,5 +1,6 @@
-// Package claudecode runs Claude Code non-interactively. Run is shared by
-// every step; Qualifier is the qualification agent.
+// Package claudecode runs Claude Code non-interactively. Exec is shared by
+// every step; Qualifier is the qualification agent and Developer the
+// development and pre-review agent.
 //
 // Every run uses --restricted, which confines the file tools to the
 // working directory (symlinks pointing outside included) and ignores the
@@ -43,7 +44,15 @@ type Session struct {
 	Dir       string   // working directory, the only one the file tools can read
 	PluginDir string   // verified skills
 	Tools     []string // the only tools available
-	Prompt    string
+	// Allowed are the permission rules, such as "Bash(git add:*)"; nil
+	// allows Tools as they are. Anything not allowed is denied.
+	Allowed []string
+	// ExtraEnv is added to the allowlisted environment.
+	ExtraEnv []string
+	// MaxTurns and Timeout override the Claude defaults when set.
+	MaxTurns int
+	Timeout  time.Duration
+	Prompt   string
 }
 
 // ReadOnlyTools are the tools of a qualification: reading the clone and
@@ -52,24 +61,35 @@ var ReadOnlyTools = []string{"Read", "Grep", "Glob", "Skill"}
 
 // Args returns the claude command line for s. The prompt is sent on
 // stdin, so issue text never appears in the process list.
+// Each permission rule is its own argument, so a rule containing a space
+// cannot be split.
 func (c *Claude) Args(s Session) []string {
-	tools := strings.Join(s.Tools, ",")
-	return []string{
+	allowed := s.Allowed
+	if allowed == nil {
+		allowed = s.Tools
+	}
+	args := []string{
 		"-p",
 		"--output-format", "json",
-		"--tools", tools,
-		"--allowedTools", tools,
+		"--tools", strings.Join(s.Tools, ","),
+		"--allowedTools",
+	}
+	args = append(args, allowed...)
+	return append(args,
 		"--permission-mode", "dontAsk",
 		"--restricted",
 		"--strict-mcp-config",
 		"--no-session-persistence",
-		"--max-turns", strconv.Itoa(c.maxTurns()),
+		"--max-turns", strconv.Itoa(c.maxTurns(s)),
 		"--plugin-dir", s.PluginDir,
-	}
+	)
 }
 
-func (c *Claude) maxTurns() int {
-	if c.MaxTurns > 0 {
+func (c *Claude) maxTurns(s Session) int {
+	switch {
+	case s.MaxTurns > 0:
+		return s.MaxTurns
+	case c.MaxTurns > 0:
 		return c.MaxTurns
 	}
 	return 30
@@ -104,6 +124,9 @@ var ErrAgent = errors.New("agent run failed")
 // Exec runs one session and returns the agent's final text.
 func (c *Claude) Exec(ctx context.Context, s Session) (string, error) {
 	timeout := c.Timeout
+	if s.Timeout > 0 {
+		timeout = s.Timeout
+	}
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -118,7 +141,7 @@ func (c *Claude) Exec(ctx context.Context, s Session) (string, error) {
 	if run == nil {
 		run = c.execRun
 	}
-	stdout, stderr, err := run(ctx, s.Dir, Env(environ()), c.Args(s), s.Prompt)
+	stdout, stderr, err := run(ctx, s.Dir, append(Env(environ()), s.ExtraEnv...), c.Args(s), s.Prompt)
 	if ctx.Err() != nil {
 		return "", fmt.Errorf("%w: timed out after %s", ErrAgent, timeout)
 	}
