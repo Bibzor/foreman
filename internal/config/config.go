@@ -20,6 +20,7 @@ import (
 // Defaults.
 const (
 	DefaultPollInterval = 30 * time.Second
+	DefaultWIPLimit     = 2
 	defaultPath         = "~/.config/foreman/config.yml"
 	defaultDataDir      = "~/.local/share/foreman"
 )
@@ -32,6 +33,9 @@ type Config struct {
 	AuthorizedUsers []string
 	PollInterval    time.Duration
 	DataDir         string
+	// WIPLimit is how many issues may be in development or in review at
+	// once, across every repository.
+	WIPLimit int
 }
 
 // Repo is a GitHub repository.
@@ -50,6 +54,7 @@ type file struct {
 	AuthorizedUsers []string `yaml:"authorized_users"`
 	PollInterval    string   `yaml:"poll_interval"`
 	DataDir         string   `yaml:"data_dir"`
+	WIPLimit        *int     `yaml:"wip_limit"`
 }
 
 // GitHub owner and repository names, restricted to characters that are
@@ -81,7 +86,7 @@ func Parse(b []byte) (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 
-	c := Config{AppID: f.AppID, PollInterval: DefaultPollInterval}
+	c := Config{AppID: f.AppID, PollInterval: DefaultPollInterval, WIPLimit: DefaultWIPLimit}
 	var errs []error
 	if f.AppID <= 0 {
 		errs = append(errs, errors.New("app_id is required"))
@@ -130,6 +135,13 @@ func Parse(b []byte) (Config, error) {
 			errs = append(errs, fmt.Errorf("poll_interval: %s is below 1s", d))
 		default:
 			c.PollInterval = d
+		}
+	}
+	if f.WIPLimit != nil {
+		if *f.WIPLimit < 1 {
+			errs = append(errs, fmt.Errorf("wip_limit: %d is below 1", *f.WIPLimit))
+		} else {
+			c.WIPLimit = *f.WIPLimit
 		}
 	}
 	dataDir := f.DataDir
