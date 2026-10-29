@@ -266,9 +266,16 @@ func (a *fakeAgent) calls() int {
 	return len(a.requests)
 }
 
-type fakeWorkspace struct{ dir string }
+type fakeWorkspace struct {
+	dir  string
+	fail int // Prepare fails this many times
+}
 
-func (w fakeWorkspace) Prepare(_ context.Context, repo config.Repo, n int) (workspace.Dirs, error) {
+func (w *fakeWorkspace) Prepare(_ context.Context, repo config.Repo, n int) (workspace.Dirs, error) {
+	if w.fail > 0 {
+		w.fail--
+		return workspace.Dirs{}, fmt.Errorf("git clone: exit status 128: could not resolve host (left %d)", w.fail)
+	}
 	return workspace.Dirs{Workdir: fmt.Sprintf("%s/work/%s/%d", w.dir, repo, n), SkillsDir: w.dir + "/skills"}, nil
 }
 

@@ -32,6 +32,9 @@ type fixture struct {
 	db     *store.Store
 	engine *orchestrator.Engine
 	now    func() time.Time
+	ws     *fakeWorkspace
+	// skew is added to foreman's clock only, not to GitHub's.
+	skew time.Duration
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -47,6 +50,7 @@ func newFixture(t *testing.T) *fixture {
 		return clock
 	}
 	fx := &fixture{t: t, dir: t.TempDir(), gh: newFakeGitHub(now), agent: &fakeAgent{}, now: now}
+	fx.ws = &fakeWorkspace{dir: fx.dir}
 	fx.restart()
 	if err := fx.engine.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -74,9 +78,9 @@ func (fx *fixture) restart() {
 		},
 		GitHub:    fx.gh,
 		Store:     db,
-		Workspace: fakeWorkspace{dir: fx.dir},
+		Workspace: fx.ws,
 		Agent:     fx.agent,
-		Now:       fx.now,
+		Now:       func() time.Time { return fx.now().Add(fx.skew) },
 	})
 	if err := fx.engine.Start(context.Background()); err != nil {
 		fx.t.Fatal(err)
@@ -654,5 +658,76 @@ func TestQueuedHasNoHandlerYet(t *testing.T) {
 	fx.tick()
 	if called != 1 || fx.state() != store.Queued {
 		t.Fatalf("registered queued handler called %d times", called)
+	}
+}
+
+// The go must be newer than the comment announcing awaiting-go, on
+// GitHub's clock: foreman's own clock does not matter.
+func TestGoComparedOnGitHubClock(t *testing.T) {
+	for _, skew := range []time.Duration{3 * time.Hour, -3 * time.Hour} {
+		t.Run(skew.String(), func(t *testing.T) {
+			fx := newFixture(t)
+			fx.skew = skew
+			fx.toAwaitingGo()
+			fx.gh.label("go", owner)
+			fx.tick()
+			if s := fx.state(); s != store.Queued {
+				t.Fatalf("state = %q, want queued", s)
+			}
+		})
+	}
+}
+
+func TestGoBeforeTheStateCommentIsIgnored(t *testing.T) {
+	fx := newFixture(t)
+	fx.skew = -3 * time.Hour // would make any go look recent
+	fx.gh.label("go", owner) // before qualification
+	fx.toAwaitingGo()
+	fx.tick()
+	if s := fx.state(); s != store.AwaitingGo {
+		t.Fatalf("state = %q, a go older than the awaiting-go comment was applied", s)
+	}
+}
+
+func TestWorkspaceFailuresAreRetriedThenBlock(t *testing.T) {
+	fx := newFixture(t)
+	fx.ws.fail = orchestrator.MaxPrepFailures
+	fx.gh.label("foreman", owner)
+	for i := 1; i < orchestrator.MaxPrepFailures; i++ {
+		if err := fx.engine.Tick(context.Background()); err == nil {
+			t.Fatalf("tick %d: no error while the workspace fails", i)
+		}
+		if s := fx.state(); s != store.Qualifying {
+			t.Fatalf("after failure %d: state = %q", i, s)
+		}
+	}
+	fx.tick()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q, want blocked", s)
+	}
+	last := fx.gh.botComments()[len(fx.gh.botComments())-1]
+	if !strings.Contains(last, "5 times in a row") || !strings.Contains(last, "could not resolve host (left 0)") {
+		t.Fatalf("comment = %q", last)
+	}
+	if fx.agent.calls() != 0 {
+		t.Fatal("agent ran without a workspace")
+	}
+}
+
+func TestWorkspaceFailureCountResetsOnSuccess(t *testing.T) {
+	fx := newFixture(t)
+	fx.ws.fail = orchestrator.MaxPrepFailures - 1
+	fx.gh.label("foreman", owner)
+	for range orchestrator.MaxPrepFailures - 1 {
+		_ = fx.engine.Tick(context.Background())
+	}
+	fx.agent.push(needsInfo())
+	fx.tick()
+	if s := fx.state(); s != store.NeedsInfo {
+		t.Fatalf("state = %q", s)
+	}
+	is, _, _ := fx.db.Get(context.Background(), repo.String(), n)
+	if is.PrepFailures != 0 {
+		t.Fatalf("PrepFailures = %d after a transition", is.PrepFailures)
 	}
 }

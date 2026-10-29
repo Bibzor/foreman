@@ -12,6 +12,7 @@ import (
 
 	"github.com/Bibzor/foreman/internal/qualify"
 	"github.com/Bibzor/foreman/internal/store"
+	"github.com/Bibzor/foreman/internal/workspace"
 )
 
 // MaxNeedsInfoRounds is how many rounds of questions an issue gets before
@@ -24,9 +25,12 @@ func (e *Engine) qualifying(ctx context.Context, c *Case) (*Transition, error) {
 	if err != nil {
 		return nil, err
 	}
-	dirs, err := e.Workspace.Prepare(ctx, c.Repo, c.Issue.Number)
-	if err != nil {
-		return nil, fmt.Errorf("prepare workspace: %w", err) // retried next cycle
+	var dirs workspace.Dirs
+	if t, err := e.prepare(ctx, c, func() (err error) {
+		dirs, err = e.Workspace.Prepare(ctx, c.Repo, c.Issue.Number)
+		return err
+	}); t != nil || err != nil {
+		return t, err
 	}
 	req := qualify.Request{Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Issue: snap}
 

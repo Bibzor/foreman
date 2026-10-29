@@ -13,6 +13,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -35,6 +36,9 @@ const (
 	Queued      State = "queued"
 	Blocked     State = "blocked"
 	Suspect     State = "suspect"
+	InProgress  State = "in-progress"
+	InReview    State = "in-review"
+	Merged      State = "merged"
 	Closed      State = "closed"
 	labelPrefix       = "foreman:"
 )
@@ -66,6 +70,25 @@ type Issue struct {
 	// snapshot, never the live issue.
 	Snapshot    string
 	SnapshotSHA string
+	// PrepFailures counts consecutive failures to prepare a workspace in
+	// the current state; every transition resets it.
+	PrepFailures int
+	// StateOutboxID is the outbox entry of the transition into the current
+	// state: its comment, on GitHub's clock, marks when the state began.
+	StateOutboxID int64
+	// BaseBranch and BaseSHA are the default branch and the commit the
+	// work started from; DevSHA is the tip pushed by the development run
+	// and HeadSHA the last tip foreman pushed.
+	BaseBranch string
+	BaseSHA    string
+	DevSHA     string
+	HeadSHA    string
+	PRNumber   int
+	// RevisionRounds counts the revisions made after a review.
+	RevisionRounds int
+	// LastReviewID is the newest PR review already handled.
+	LastReviewID  int64
+	PrereviewDone bool
 }
 
 // Transition is a history entry.
@@ -81,11 +104,22 @@ type Transition struct {
 
 // Effect is what a transition or notice does on GitHub.
 type Effect struct {
+	OpenPR       *PullRequest // opened (or adopted) before anything else
 	Comment      string
+	PR           int      // when set, Comment and AddLabels go to this pull request
 	RemoveLabels []string // e.g. a consumed go label
-	SyncLabel    bool     // mirror the state as a foreman:* label
+	SyncLabel    bool     // mirror the state as a foreman:* label on the issue
 	State        State    // the state to mirror when SyncLabel is set
+	AddLabels    []string
 	Close        bool
+}
+
+// PullRequest is a pull request to open.
+type PullRequest struct {
+	Head  string `json:"head"`
+	Base  string `json:"base"`
+	Title string `json:"title"`
+	Body  string `json:"body"`
 }
 
 // Outbox is a pending Effect.
@@ -166,6 +200,19 @@ var migrations = []string{
 		event_id INTEGER NOT NULL,
 		PRIMARY KEY (repo, number, event_id)
 	);`,
+	`ALTER TABLE issues ADD COLUMN prep_failures INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN state_outbox_id INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN base_branch TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN base_sha TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN dev_sha TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN head_sha TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN pr_number INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN revision_rounds INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN last_review_id INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN prereview_done INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE outbox ADD COLUMN open_pr TEXT NOT NULL DEFAULT '';
+	ALTER TABLE outbox ADD COLUMN pr INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE outbox ADD COLUMN add_labels TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -200,12 +247,14 @@ func (s *Store) tx(ctx context.Context, f func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 
-const issueCols = `repo, number, state, author, needs_info_rounds, state_entered_at, qualification, snapshot, snapshot_sha256`
+const issueCols = `repo, number, state, author, needs_info_rounds, state_entered_at, qualification, snapshot, snapshot_sha256,
+	prep_failures, state_outbox_id, base_branch, base_sha, dev_sha, head_sha, pr_number, revision_rounds, last_review_id, prereview_done`
 
 func scanIssue(row interface{ Scan(...any) error }) (Issue, error) {
 	var is Issue
 	var at string
-	err := row.Scan(&is.Repo, &is.Number, &is.State, &is.Author, &is.NeedsInfoRounds, &at, &is.Qualification, &is.Snapshot, &is.SnapshotSHA)
+	err := row.Scan(&is.Repo, &is.Number, &is.State, &is.Author, &is.NeedsInfoRounds, &at, &is.Qualification, &is.Snapshot, &is.SnapshotSHA,
+		&is.PrepFailures, &is.StateOutboxID, &is.BaseBranch, &is.BaseSHA, &is.DevSHA, &is.HeadSHA, &is.PRNumber, &is.RevisionRounds, &is.LastReviewID, &is.PrereviewDone)
 	if err != nil {
 		return Issue{}, err
 	}
@@ -255,11 +304,12 @@ func (s *Store) Snapshot(ctx context.Context, repo string, number int) (snapshot
 
 // Transition moves an issue from state from to next.State, records the
 // history entry and queues effect, in one database transaction. next is
-// the full new issue row. It fails with ErrConflict if the stored state
-// is not from (None: the issue must not be tracked yet).
-func (s *Store) Transition(ctx context.Context, from State, next Issue, reason string, effect Effect) error {
+// the full new issue row; the stored row is returned, with StateOutboxID
+// set to the queued entry. It fails with ErrConflict if the stored state is not from (None: the
+// issue must not be tracked yet).
+func (s *Store) Transition(ctx context.Context, from State, next Issue, reason string, effect Effect) (Issue, error) {
 	at := next.StateEnteredAt.UTC().Format(time.RFC3339Nano)
-	return s.tx(ctx, func(tx *sql.Tx) error {
+	err := s.tx(ctx, func(tx *sql.Tx) error {
 		var cur State
 		err := tx.QueryRowContext(ctx, `SELECT state FROM issues WHERE repo = ? AND number = ?`, next.Repo, next.Number).Scan(&cur)
 		switch {
@@ -271,25 +321,69 @@ func (s *Store) Transition(ctx context.Context, from State, next Issue, reason s
 		if cur != from {
 			return fmt.Errorf("%s#%d is %q, not %q: %w", next.Repo, next.Number, cur, from, ErrConflict)
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO issues (`+issueCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (repo, number) DO UPDATE SET state = excluded.state, author = excluded.author,
-			needs_info_rounds = excluded.needs_info_rounds, state_entered_at = excluded.state_entered_at,
-			qualification = excluded.qualification, snapshot = excluded.snapshot, snapshot_sha256 = excluded.snapshot_sha256`,
-			next.Repo, next.Number, next.State, next.Author, next.NeedsInfoRounds, at, next.Qualification, next.Snapshot, next.SnapshotSHA)
-		if err != nil {
-			return err
-		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO transitions (repo, number, from_state, to_state, reason, at) VALUES (?, ?, ?, ?, ?, ?)`,
 			next.Repo, next.Number, from, next.State, reason, at); err != nil {
 			return err
 		}
 		effect.SyncLabel, effect.State = true, next.State
-		return queue(ctx, tx, next.Repo, next.Number, effect)
+		id, err := queue(ctx, tx, next.Repo, next.Number, effect)
+		if err != nil {
+			return err
+		}
+		next.StateOutboxID = id
+		_, err = tx.ExecContext(ctx, `INSERT INTO issues (`+issueCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (repo, number) DO UPDATE SET state = excluded.state, author = excluded.author,
+			needs_info_rounds = excluded.needs_info_rounds, state_entered_at = excluded.state_entered_at,
+			qualification = excluded.qualification, snapshot = excluded.snapshot, snapshot_sha256 = excluded.snapshot_sha256,
+			prep_failures = excluded.prep_failures, state_outbox_id = excluded.state_outbox_id,
+			base_branch = excluded.base_branch, base_sha = excluded.base_sha, dev_sha = excluded.dev_sha, head_sha = excluded.head_sha,
+			pr_number = excluded.pr_number, revision_rounds = excluded.revision_rounds,
+			last_review_id = excluded.last_review_id, prereview_done = excluded.prereview_done`,
+			next.Repo, next.Number, next.State, next.Author, next.NeedsInfoRounds, at, next.Qualification, next.Snapshot, next.SnapshotSHA,
+			next.PrepFailures, next.StateOutboxID, next.BaseBranch, next.BaseSHA, next.DevSHA, next.HeadSHA,
+			next.PRNumber, next.RevisionRounds, next.LastReviewID, next.PrereviewDone)
+		return err
 	})
+	if err != nil {
+		return Issue{}, err
+	}
+	return next, nil
+}
+
+// PrepFailed records one more failure to prepare a workspace for the
+// issue and returns the count of consecutive failures.
+func (s *Store) PrepFailed(ctx context.Context, repo string, number int) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `UPDATE issues SET prep_failures = prep_failures + 1 WHERE repo = ? AND number = ? RETURNING prep_failures`,
+		repo, number).Scan(&n)
+	return n, err
+}
+
+// SetPR records the pull request opened for an issue.
+func (s *Store) SetPR(ctx context.Context, repo string, number, pr int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE issues SET pr_number = ? WHERE repo = ? AND number = ?`, pr, repo, number)
+	return err
+}
+
+// CountInStates counts the tracked issues of every repository that are in
+// one of states.
+func (s *Store) CountInStates(ctx context.Context, states ...State) (int, error) {
+	if len(states) == 0 {
+		return 0, nil
+	}
+	args := make([]any, len(states))
+	for i, st := range states {
+		args[i] = st
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM issues WHERE state IN (?`+strings.Repeat(", ?", len(states)-1)+`)`, args...).Scan(&n)
+	return n, err
 }
 
 // Notice queues a one-off comment keyed by a GitHub event. It returns
-// false, and queues nothing, if that event was already noticed.
+// false, and queues nothing, if that event was already noticed. GitHub
+// event IDs are positive: foreman keys its own one-off notices with
+// negative IDs (see the orchestrator).
 func (s *Store) Notice(ctx context.Context, repo string, number int, eventID int64, comment string) (bool, error) {
 	added := false
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -301,21 +395,34 @@ func (s *Store) Notice(ctx context.Context, repo string, number int, eventID int
 			return nil
 		}
 		added = true
-		return queue(ctx, tx, repo, number, Effect{Comment: comment})
+		_, err = queue(ctx, tx, repo, number, Effect{Comment: comment})
+		return err
 	})
 	return added, err
 }
 
-func queue(ctx context.Context, tx *sql.Tx, repo string, number int, e Effect) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO outbox (repo, number, comment, remove_labels, sync_label, state, close_issue) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		repo, number, e.Comment, strings.Join(e.RemoveLabels, "\n"), e.SyncLabel, e.State, e.Close)
-	return err
+func queue(ctx context.Context, tx *sql.Tx, repo string, number int, e Effect) (int64, error) {
+	var openPR string
+	if e.OpenPR != nil {
+		b, err := json.Marshal(e.OpenPR)
+		if err != nil {
+			return 0, err
+		}
+		openPR = string(b)
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO outbox (repo, number, comment, remove_labels, sync_label, state, close_issue, open_pr, pr, add_labels)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		repo, number, e.Comment, strings.Join(e.RemoveLabels, "\n"), e.SyncLabel, e.State, e.Close, openPR, e.PR, strings.Join(e.AddLabels, "\n"))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
 }
 
 // Pending returns the outbox entries not done yet, oldest first.
 func (s *Store) Pending(ctx context.Context, repo string) ([]Outbox, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, repo, number, comment, remove_labels, sync_label, state, close_issue, comment_posted
-		FROM outbox WHERE repo = ? AND done = 0 ORDER BY id`, repo)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, repo, number, comment, remove_labels, sync_label, state, close_issue, comment_posted,
+		open_pr, pr, add_labels FROM outbox WHERE repo = ? AND done = 0 ORDER BY id`, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -323,12 +430,22 @@ func (s *Store) Pending(ctx context.Context, repo string) ([]Outbox, error) {
 	var out []Outbox
 	for rows.Next() {
 		var o Outbox
-		var remove string
-		if err := rows.Scan(&o.ID, &o.Repo, &o.Number, &o.Comment, &remove, &o.SyncLabel, &o.State, &o.Close, &o.CommentPosted); err != nil {
+		var remove, add, openPR string
+		if err := rows.Scan(&o.ID, &o.Repo, &o.Number, &o.Comment, &remove, &o.SyncLabel, &o.State, &o.Close, &o.CommentPosted,
+			&openPR, &o.PR, &add); err != nil {
 			return nil, err
 		}
 		if remove != "" {
 			o.RemoveLabels = strings.Split(remove, "\n")
+		}
+		if add != "" {
+			o.AddLabels = strings.Split(add, "\n")
+		}
+		if openPR != "" {
+			o.OpenPR = new(PullRequest)
+			if err := json.Unmarshal([]byte(openPR), o.OpenPR); err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, o)
 	}

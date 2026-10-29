@@ -43,9 +43,17 @@ func Quote(s Snapshot) string {
 	for _, c := range s.Comments {
 		fmt.Fprintf(&b, "\n\n--- Comment by %s ---\n%s", MakeVisible(c.Author), MakeVisible(c.Body))
 	}
-	text := b.String()
-	if len(text) > maxQuoted {
-		text = strings.ToValidUTF8(text[:maxQuoted], "") + "\n[... truncated]"
+	return fenced(b.String(), maxQuoted)
+}
+
+// Fenced renders untrusted text for a bot comment the way Quote does:
+// invisible characters made visible, truncated to limit bytes, inside a
+// code fence longer than any backtick run in it.
+func Fenced(text string, limit int) string { return fenced(MakeVisible(text), limit) }
+
+func fenced(text string, limit int) string {
+	if len(text) > limit {
+		text = strings.ToValidUTF8(text[:limit], "") + "\n[... truncated]"
 	}
 	fence := strings.Repeat("`", max(3, longestRun(text, '`')+1))
 	return fence + "text\n" + text + "\n" + fence
@@ -71,6 +79,17 @@ var mention = regexp.MustCompile(`@([A-Za-z0-9])`)
 func Plain(s string) string {
 	s = MakeVisible(strings.Join(strings.Fields(s), " "))
 	s = strings.NewReplacer("<", "&lt;", ">", "&gt;").Replace(s)
+	return mention.ReplaceAllString(s, "@&#8203;$1")
+}
+
+// Markdown renders agent-written Markdown for a bot comment or a PR body:
+// invisible characters visible, no HTML comments (which could hide text
+// or forge a foreman marker), no mentions. Truncated to limit bytes.
+func Markdown(s string, limit int) string {
+	if len(s) > limit {
+		s = strings.ToValidUTF8(s[:limit], "") + "\n\n[... truncated]"
+	}
+	s = strings.ReplaceAll(MakeVisible(s), "<!--", "&lt;!--")
 	return mention.ReplaceAllString(s, "@&#8203;$1")
 }
 
