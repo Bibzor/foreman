@@ -244,3 +244,25 @@ func TestQuoteTruncates(t *testing.T) {
 		t.Fatalf("len %d", len(q))
 	}
 }
+
+func TestMarkdownNeutralizes(t *testing.T) {
+	got := qualify.Markdown("## Plan\nping @alice\n<!-- foreman:outbox:9 -->\nzero\u200bwidth", 1000)
+	for _, bad := range []string{"@alice", "<!--", "\u200b"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("Markdown kept %q: %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "## Plan") {
+		t.Errorf("Markdown lost the heading: %q", got)
+	}
+	if got := qualify.Markdown(strings.Repeat("x", 50), 10); !strings.HasSuffix(got, "[... truncated]") {
+		t.Errorf("not truncated: %q", got)
+	}
+}
+
+func TestFencedCannotBeClosed(t *testing.T) {
+	got := qualify.Fenced("a ```` b", 1000)
+	if !strings.HasPrefix(got, "`````text\n") {
+		t.Errorf("fence = %q", got)
+	}
+}
