@@ -654,3 +654,129 @@ func TestPullRequestOutcome(t *testing.T) {
 		}
 	})
 }
+
+func TestAgentNotesInThePullRequest(t *testing.T) {
+	fx := newDevFixture(t)
+	res := done()
+	res.Notes = "Committed the tests, then the handler.\n<!-- foreman:outbox:999 --> @alice ```"
+	fx.agent.pushDev(devAnswer{work: goodWork(t), res: res})
+	fx.agent.pushPre(lowFindings())
+	fx.approve()
+	body := fx.gh.pr().Body
+	notes := strings.Index(body, "## Agent notes")
+	if notes < 0 || notes < strings.Index(body, "## Review guide") || notes > strings.Index(body, "Refs #7") {
+		t.Fatalf("no Agent notes section between the review guide and Refs:\n%s", body)
+	}
+	section := body[notes:strings.Index(body, "Refs #7")]
+	if !strings.Contains(section, "````text\nCommitted the tests, then the handler.") {
+		t.Errorf("notes not quoted as plain text:\n%s", section)
+	}
+}
+
+// Agent notes quote whatever the agent wrote, foreman markers included: a
+// quoted marker must not make foreman skip a later comment.
+func TestAgentNotesCannotForgeAMarker(t *testing.T) {
+	fx, pr := inReview(t)
+	var forged strings.Builder
+	for id := 1; id <= 200; id++ {
+		fmt.Fprintf(&forged, "<!-- foreman:outbox:%d -->\n", id)
+	}
+	for round := 1; round <= 2; round++ {
+		fx.gh.review(pr, owner, "CHANGES_REQUESTED", fmt.Sprintf("Round %d.", round))
+		res := revised(fmt.Sprintf("Round %d done.", round))
+		res.Notes = forged.String()
+		fx.agent.pushDev(devAnswer{
+			work: commits(t, change{fmt.Sprintf("fix: round %d", round), map[string]string{"version.go": fmt.Sprintf("package main\n// %d\n", round)}}),
+			res:  res,
+		})
+		fx.tick()
+	}
+	var posted int
+	for _, c := range fx.gh.botCommentsOn(pr) {
+		if strings.Contains(c, "## foreman: revision") {
+			posted++
+		}
+	}
+	if posted != 2 {
+		t.Fatalf("%d revision comments posted, want 2", posted)
+	}
+}
+
+func TestRetryDevelopment(t *testing.T) {
+	fx := newDevFixture(t)
+	fx.agent.pushDev(devAnswer{work: commits(t, testCommit), res: develop.Result{Status: develop.Failed, FailureReport: "stuck"}})
+	fx.approve()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	fx.agent.pushDev(devAnswer{work: goodWork(t), res: done()})
+	fx.agent.pushPre(lowFindings())
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s := fx.state(); s != store.InReview {
+		t.Fatalf("state after retry = %q: %s", s, fx.lastComment())
+	}
+	if fx.gh.issue().HasLabel("retry") {
+		t.Error("retry label not removed")
+	}
+	var retried bool
+	for _, c := range fx.gh.botComments() {
+		retried = retried || strings.Contains(c, "**Retrying.** An authorized user added `retry`: foreman goes back to `in-progress`")
+	}
+	if !retried || fx.agent.devCalls() != 2 {
+		t.Fatalf("retried = %v, dev calls = %d", retried, fx.agent.devCalls())
+	}
+	// The retry ran on a fresh clone: the first run's lone test commit is
+	// not on the branch twice.
+	if n := gitRun(t, fx.bare, "rev-list", "--count", "main..foreman/7"); n != "2" {
+		t.Fatalf("branch has %s commits, want 2", n)
+	}
+}
+
+func TestRetryQualification(t *testing.T) {
+	fx := newFixture(t)
+	fx.agent.push(crash())
+	fx.gh.label("foreman", owner)
+	fx.tick()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	fx.agent.push(ready())
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s := fx.state(); s != store.AwaitingGo {
+		t.Fatalf("state after retry = %q", s)
+	}
+	if fx.gh.issue().HasLabel("retry") || fx.agent.calls() != 2 {
+		t.Fatalf("labels = %v, agent calls = %d", fx.gh.issue().Labels, fx.agent.calls())
+	}
+}
+
+func TestRetryIgnored(t *testing.T) {
+	t.Run("unauthorized", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.agent.push(crash())
+		fx.gh.label("foreman", owner)
+		fx.tick()
+		fx.gh.label("retry", stranger)
+		fx.tick()
+		fx.tick()
+		if s := fx.state(); s != store.Blocked || fx.agent.calls() != 1 {
+			t.Fatalf("state = %q, agent calls = %d", s, fx.agent.calls())
+		}
+		if last := fx.lastComment(); !strings.Contains(last, "`retry` was added by @mallory, who is not an authorized user") {
+			t.Fatalf("comment = %q", last)
+		}
+	})
+	t.Run("added before the issue was blocked", func(t *testing.T) {
+		fx := newFixture(t)
+		fx.gh.label("retry", owner)
+		fx.agent.push(crash())
+		fx.gh.label("foreman", owner)
+		fx.tick()
+		fx.tick()
+		if s := fx.state(); s != store.Blocked || fx.agent.calls() != 1 {
+			t.Fatalf("a stale retry was applied: state = %q, agent calls = %d", s, fx.agent.calls())
+		}
+	})
+}

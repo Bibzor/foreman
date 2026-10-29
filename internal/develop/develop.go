@@ -26,6 +26,9 @@ type Result struct {
 	Plan          string `json:"plan"`
 	ReviewGuide   string `json:"review_guide"`
 	FailureReport string `json:"failure_report"`
+	// Notes is the free text the agent wrote before the JSON object. It
+	// is untrusted.
+	Notes string `json:"-"`
 }
 
 // Review is the review a revision answers. It is untrusted.
@@ -110,12 +113,15 @@ type Agent interface {
 
 var resultKeys = []string{"status", "plan", "review_guide", "failure_report"}
 
-// Parse validates the final text of a development or revision run.
+// Parse validates the final JSON object of a development or revision run
+// and keeps the text before it as Notes.
 func Parse(text string) (Result, error) {
 	var r Result
-	if err := qualify.DecodeStrict(text, &r, resultKeys); err != nil {
+	notes, err := qualify.DecodeStrict(text, &r, resultKeys)
+	if err != nil {
 		return Result{}, err
 	}
+	r.Notes = notes
 	var errs []error
 	switch r.Status {
 	case Done:
@@ -138,7 +144,7 @@ func Parse(text string) (Result, error) {
 // ParsePreReview validates the final text of a pre-review.
 func ParsePreReview(text string) (PreReviewResult, error) {
 	var r PreReviewResult
-	if err := qualify.DecodeStrict(text, &r, []string{"report", "findings"}); err != nil {
+	if _, err := qualify.DecodeStrict(text, &r, []string{"report", "findings"}); err != nil {
 		return PreReviewResult{}, err
 	}
 	var errs []error

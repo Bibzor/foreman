@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 )
 
 // Decisions, as in the foreman-qualify skill.
@@ -102,35 +103,29 @@ var resultKeys = []string{
 	"size", "touches", "risks", "suspicious", "suspicious_reasons",
 }
 
-// Parse extracts the JSON object from the agent's final text and
-// validates it against the foreman-qualify output shape.
+// Parse extracts the final JSON object from the agent's output and
+// validates it against the foreman-qualify output shape. Text before the
+// object is ignored.
 func Parse(text string) (Result, error) {
 	var r Result
-	if err := DecodeStrict(text, &r, resultKeys); err != nil {
+	if _, err := DecodeStrict(text, &r, resultKeys); err != nil {
 		return Result{}, err
 	}
 	return r, r.validate()
 }
 
-// DecodeStrict extracts the JSON object from an agent's final text (bare,
-// or in a single ```json fence) and decodes it into v: every key of keys
-// present and not null, no other key, right types.
-func DecodeStrict(text string, v any, keys []string) error {
-	body := strings.TrimSpace(text)
-	if strings.HasPrefix(body, "```") {
-		nl := strings.IndexByte(body, '\n')
-		if nl < 0 || !strings.HasSuffix(body, "```") || len(body) < nl+4 {
-			return errors.New("unterminated code fence")
-		}
-		if lang := strings.TrimSpace(body[3:nl]); lang != "" && lang != "json" {
-			return fmt.Errorf("code fence language %q", lang)
-		}
-		body = strings.TrimSpace(body[nl+1 : len(body)-3])
+// DecodeStrict takes the last top-level JSON object of an agent's output,
+// bare or in a final ```json fence, and decodes it into v: every key of
+// keys present and not null, no other key, right types. Nothing may follow
+// the object. The text before it is returned as notes: it is untrusted.
+func DecodeStrict(text string, v any, keys []string) (notes string, err error) {
+	notes, body, err := splitJSON(text)
+	if err != nil {
+		return "", err
 	}
-
 	var got map[string]json.RawMessage
 	if err := strictDecode(body, &got); err != nil {
-		return err
+		return "", err
 	}
 	var errs []error
 	for _, k := range keys {
@@ -146,7 +141,43 @@ func DecodeStrict(text string, v any, keys []string) error {
 			errs = append(errs, fmt.Errorf("%q is null", k))
 		}
 	}
-	return errors.Join(errs...)
+	return strings.TrimSpace(notes), errors.Join(errs...)
+}
+
+// splitJSON separates the output into the text before the final JSON
+// object and the object. When no final object is found, body is the whole
+// text, for strictDecode to report what is wrong with it.
+func splitJSON(text string) (notes, body string, err error) {
+	t := strings.TrimRightFunc(text, unicode.IsSpace)
+	if strings.HasSuffix(t, "```") {
+		inner := t[:len(t)-3]
+		// JSON strings cannot hold a raw newline, so a fence at the start
+		// of a line is never inside the object.
+		open := strings.LastIndex("\n"+inner, "\n```")
+		if open < 0 {
+			return "", "", errors.New("unterminated code fence")
+		}
+		nl := strings.IndexByte(inner[open:], '\n')
+		if nl < 0 {
+			return "", "", errors.New("unterminated code fence")
+		}
+		if lang := strings.TrimSpace(inner[open+3 : open+nl]); lang != "" && lang != "json" {
+			return "", "", fmt.Errorf("code fence language %q", lang)
+		}
+		return inner[:open], strings.TrimSpace(inner[open+nl+1:]), nil
+	}
+	// The top-level object is the one starting at the first brace from
+	// which the rest of the output is exactly one JSON value.
+	for i := 0; i < len(t); i++ {
+		if t[i] == '{' && json.Valid([]byte(t[i:])) {
+			notes = t[:i]
+			if strings.Count(notes, "```")%2 == 1 {
+				return "", "", errors.New("unterminated code fence")
+			}
+			return notes, t[i:], nil
+		}
+	}
+	return "", strings.TrimSpace(text), nil
 }
 
 func strictDecode(s string, v any) error {

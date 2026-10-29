@@ -30,6 +30,7 @@ const (
 	LabelGo       = "go"
 	LabelNoGo     = "no-go"
 	LabelHighRisk = "foreman:high-risk"
+	LabelRetry    = "retry"
 )
 
 // GitHub is what the engine needs from GitHub.
@@ -127,6 +128,7 @@ func New(d Deps) *Engine {
 	e.Register(store.Queued, HandlerFunc(e.queued))
 	e.Register(store.InProgress, HandlerFunc(e.inProgress))
 	e.Register(store.InReview, HandlerFunc(e.inReview))
+	e.Register(store.Blocked, HandlerFunc(e.retry))
 	return e
 }
 
@@ -149,6 +151,7 @@ func Labels() []github.Label {
 		{Name: store.Suspect.Label(), Color: "d93f0b", Description: "foreman: suspicious, needs a human"},
 		{Name: LabelGo, Color: "0e8a16", Description: "Approve (authorized users only)"},
 		{Name: LabelNoGo, Color: "b60205", Description: "Reject (authorized users only)"},
+		{Name: LabelRetry, Color: "fbca04", Description: "Run the blocked step again (authorized users only)"},
 	}
 }
 
@@ -337,6 +340,11 @@ func (e *Engine) apply(ctx context.Context, c *Case, t *Transition) error {
 // just before a crash is recognized instead of posted twice.
 func marker(id int64) string { return fmt.Sprintf("<!-- foreman:outbox:%d -->", id) }
 
+// hasMarker reports whether body ends with mark, where foreman puts it.
+// A marker anywhere else may be agent or issue text quoted in the body,
+// and must not pass for the real one.
+func hasMarker(body, mark string) bool { return strings.HasSuffix(strings.TrimSpace(body), mark) }
+
 // errOutbox marks a failure to apply pending GitHub side effects.
 var errOutbox = errors.New("outbox")
 
@@ -403,7 +411,7 @@ func (e *Engine) postOnce(ctx context.Context, repo config.Repo, o store.Outbox)
 		return err
 	}
 	for _, c := range comments {
-		if e.isBot(c.Author) && strings.Contains(c.Body, mark) {
+		if e.isBot(c.Author) && hasMarker(c.Body, mark) {
 			return nil
 		}
 	}
@@ -422,7 +430,7 @@ func (e *Engine) openPR(ctx context.Context, repo config.Repo, o store.Outbox) e
 	}
 	number := 0
 	for _, pr := range prs {
-		if strings.Contains(pr.Body, mark) {
+		if hasMarker(pr.Body, mark) {
 			number = pr.Number
 			break
 		}
@@ -503,9 +511,10 @@ func (c *Case) Snapshot(ctx context.Context) (qualify.Snapshot, error) {
 }
 
 // Authorized reports whether label is on the issue and its latest
-// "labeled" event is by an authorized user. For go and no-go the event
-// must also be newer than the comment announcing the current state, so a
-// stale approval cannot carry over; both times come from GitHub's clock.
+// "labeled" event is by an authorized user. For go, no-go and retry the
+// event must also be newer than the comment announcing the current state,
+// so a stale approval cannot carry over; both times come from GitHub's
+// clock.
 // A label added by anyone else is ignored, and the bot says so once per
 // labeling event.
 func (c *Case) Authorized(ctx context.Context, label string) (bool, error) {
@@ -556,7 +565,7 @@ func (c *Case) stateCommentTime(ctx context.Context) (time.Time, bool, error) {
 	}
 	mark := marker(c.Issue.StateOutboxID)
 	for _, cm := range cs {
-		if c.e.isBot(cm.Author) && strings.Contains(cm.Body, mark) {
+		if c.e.isBot(cm.Author) && hasMarker(cm.Body, mark) {
 			return cm.CreatedAt, true, nil
 		}
 	}
