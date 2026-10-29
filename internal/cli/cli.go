@@ -98,7 +98,7 @@ func install(args []string, stdout, stderr io.Writer) error {
 	if target == "" {
 		return fmt.Errorf("%w: --target is required", errUsage)
 	}
-	lock, err := skillpack.Install(skills.FS, target, agentName, version.Version)
+	lock, err := skillpack.Install(skills.FS, target, agentName, skills.PackVersion)
 	if err != nil {
 		return err
 	}
@@ -117,17 +117,17 @@ func verify(args []string, stdout, stderr io.Writer) error {
 	if target == "" {
 		return fmt.Errorf("%w: --target is required", errUsage)
 	}
-	r, err := skillpack.Verify(skills.FS, target, version.Version)
+	r, err := skillpack.Verify(skills.FS, target, skills.PackVersion)
 	if err != nil {
 		return err
 	}
 	if r.OK() {
-		_, err := fmt.Fprintf(stdout, "ok: skills %s installed in %s match this binary\n", r.BinaryVersion, target)
+		_, err := fmt.Fprintf(stdout, "ok: skills %s installed in %s match what foreman ships\n", r.PackVersion, target)
 		return err
 	}
 	var b strings.Builder
-	if r.LockVersion != r.BinaryVersion {
-		fmt.Fprintf(&b, "version: installed %s, binary %s\n", r.LockVersion, r.BinaryVersion)
+	if r.LockVersion != r.PackVersion {
+		fmt.Fprintf(&b, "version: installed %s, foreman ships %s\n", r.LockVersion, r.PackVersion)
 	}
 	for _, group := range []struct {
 		label string
@@ -140,7 +140,7 @@ func verify(args []string, stdout, stderr io.Writer) error {
 	if _, err := io.WriteString(stdout, b.String()); err != nil {
 		return err
 	}
-	return errors.New("skills do not match this binary (run foreman skills install to restore them)")
+	return errors.New("skills do not match what foreman ships (run foreman skills install to restore them)")
 }
 
 func list(args []string, stdout, stderr io.Writer) error {

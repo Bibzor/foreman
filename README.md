@@ -7,7 +7,13 @@ by the agent comes next. It also ships the skills pack those agents use.
 ## Skills
 
 The skills live in [`skills/`](skills) as `<name>/SKILL.md` and are
-embedded in the binary. The skills version is the binary version.
+embedded in the binary. The pack has its own version,
+`skills.PackVersion` (semver, in [`skills/skills.go`](skills/skills.go)),
+independent of the binary version, which only `foreman version` reports.
+A pull request that changes a skill bumps `PackVersion` and updates
+`PackSHA256` next to it: a test fails if the pack changes under an
+unchanged version. Projects pin the pack with `skills_version` in their
+`.foreman.yml`.
 
 | Skill | Purpose |
 |-------|---------|
@@ -145,8 +151,8 @@ directories to `.gitignore`. It refuses symlinks on the install path and
 never writes outside the target. Only `claude` is supported for now; the
 agent-to-directory mapping lives in [`internal/agent`](internal/agent).
 
-`verify` checks the installed files against the skills embedded in the
-binary, not against the lock (which anyone able to edit a skill could also
+`verify` checks the installed files and the lock version against the
+skills embedded in the binary, not against the lock (which anyone able to edit a skill could also
 rewrite). It exits non-zero and lists every missing, modified or extra
 file, or a version mismatch.
 

@@ -15,16 +15,16 @@ import (
 // Report is the result of Verify. Paths are slash-separated, relative to
 // the target, and sorted.
 type Report struct {
-	BinaryVersion string
-	LockVersion   string
-	Missing       []string // in the pack, absent from the target
-	Modified      []string // content differs from the pack, or not a regular file
-	Extra         []string // in the skills directory, not in the pack
+	PackVersion string   // the version foreman ships
+	LockVersion string   // the version recorded at install
+	Missing     []string // in the pack, absent from the target
+	Modified    []string // content differs from the pack, or not a regular file
+	Extra       []string // in the skills directory, not in the pack
 }
 
 // OK reports whether the installed skills match the pack exactly.
 func (r Report) OK() bool {
-	return r.LockVersion == r.BinaryVersion && len(r.Missing)+len(r.Modified)+len(r.Extra) == 0
+	return r.LockVersion == r.PackVersion && len(r.Missing)+len(r.Modified)+len(r.Extra) == 0
 }
 
 // Verify compares the skills installed in target with pack, the source of
@@ -60,7 +60,7 @@ func Verify(pack fs.FS, target, version string) (Report, error) {
 		return Report{}, err
 	}
 
-	r := Report{BinaryVersion: version, LockVersion: lock.Version}
+	r := Report{PackVersion: version, LockVersion: lock.Version}
 	for _, p := range sortedKeys(files) {
 		switch state(root, p, files[p]) {
 		case missing:

@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io/fs"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/Bibzor/foreman/internal/skillpack"
 )
@@ -89,5 +91,41 @@ func TestQualifyIsUnchanged(t *testing.T) {
 	const want = "086d7e47e6b9e5bda6fa2f89a4fc1a96200424cf63819ce936b80fa51c863621"
 	if got := hex.EncodeToString(h[:]); got != want {
 		t.Errorf("foreman-qualify/SKILL.md sha256 = %s, want %s", got, want)
+	}
+}
+
+// A skill cannot change without a new PackVersion: the hash of the whole
+// pack is pinned next to the version.
+func TestPackVersionBumped(t *testing.T) {
+	got, err := PackHash(FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != PackSHA256 {
+		t.Errorf("skills changed: bump PackVersion (now %s) and set PackSHA256 = %q", PackVersion, got)
+	}
+}
+
+func TestPackHashSeesEveryChange(t *testing.T) {
+	base := fstest.MapFS{"a/SKILL.md": {Data: []byte("x")}, "b/SKILL.md": {Data: []byte("y")}}
+	h0, err := PackHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, pack := range map[string]fstest.MapFS{
+		"content": {"a/SKILL.md": {Data: []byte("z")}, "b/SKILL.md": {Data: []byte("y")}},
+		"rename":  {"a/SKILL.md": {Data: []byte("x")}, "c/SKILL.md": {Data: []byte("y")}},
+		"added":   {"a/SKILL.md": {Data: []byte("x")}, "b/SKILL.md": {Data: []byte("y")}, "c/SKILL.md": {Data: []byte("")}},
+		"moved":   {"a/SKILL.md": {Data: []byte("xy")}, "b/SKILL.md": {Data: []byte("")}},
+	} {
+		if h, err := PackHash(pack); err != nil || h == h0 {
+			t.Errorf("%s: hash unchanged (%v)", name, err)
+		}
+	}
+}
+
+func TestPackVersionIsSemver(t *testing.T) {
+	if !regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(PackVersion) {
+		t.Errorf("PackVersion = %q, want MAJOR.MINOR.PATCH", PackVersion)
 	}
 }
