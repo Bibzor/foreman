@@ -222,7 +222,7 @@ func TestVerifyDetectsChanges(t *testing.T) {
 			want: skillpack.Report{Extra: []string{".claude/skills/linked"}},
 		},
 		{
-			name: "lock version differs from binary",
+			name: "lock version differs from the pack",
 			mutate: func(t *testing.T, target string) {
 				l := readLock(t, target)
 				l.Version = "v0.9.0"
@@ -273,14 +273,14 @@ func TestVerifyDetectsChanges(t *testing.T) {
 	}
 }
 
-func TestVerifyUsesBinaryVersion(t *testing.T) {
+func TestVerifyUsesPackVersion(t *testing.T) {
 	target := t.TempDir()
 	install(t, target)
 	r, err := skillpack.Verify(testPack(), target, "v2.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.OK() || r.LockVersion != "v1.0.0" || r.BinaryVersion != "v2.0.0" {
+	if r.OK() || r.LockVersion != "v1.0.0" || r.PackVersion != "v2.0.0" {
 		t.Errorf("Verify = %+v, want version mismatch v1.0.0 vs v2.0.0", r)
 	}
 }
