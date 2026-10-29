@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -174,5 +175,226 @@ func TestScanForSecrets(t *testing.T) {
 	err := scanForSecrets(dir, []string{testToken})
 	if !errors.Is(err, ErrTokenOnDisk) || strings.Contains(err.Error(), testToken) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+var repoID = config.Repo{Owner: "Bibzor", Name: "demo-api"}
+
+func write(t *testing.T, dir, name, content string) {
+	t.Helper()
+	p := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// commit writes files in dir and commits them, as an agent would.
+func commit(t *testing.T, dir, msg string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		write(t, dir, name, content)
+	}
+	run(t, dir, "add", "-A")
+	run(t, dir, "commit", "-q", "-m", msg)
+}
+
+func TestPrepareReadsProjectFile(t *testing.T) {
+	bare := upstream(t)
+	w := newWorkspace(t, bare)
+	d, err := w.Prepare(context.Background(), repoID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.ProjectFile != nil || d.BaseBranch != "trunk" || d.Base != run(t, d.Workdir, "rev-parse", "HEAD") {
+		t.Fatalf("dirs = %+v", d)
+	}
+
+	src := t.TempDir()
+	run(t, src, "clone", "-q", bare, ".")
+	commit(t, src, "config", map[string]string{".foreman.yml": "agent: claude\n"})
+	run(t, src, "push", "-q", "origin", "HEAD:trunk")
+	d, err = w.PrepareDev(context.Background(), repoID, 7, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(d.ProjectFile) != "agent: claude\n" {
+		t.Fatalf("ProjectFile = %q", d.ProjectFile)
+	}
+	if b := run(t, d.Workdir, "branch", "--show-current"); b != "foreman/7" {
+		t.Fatalf("branch = %q", b)
+	}
+}
+
+// pushBranch makes foreman/7 on the upstream: two commits over trunk.
+func pushBranch(t *testing.T, bare string) (base, tip string) {
+	t.Helper()
+	src := t.TempDir()
+	run(t, src, "clone", "-q", bare, ".")
+	base = run(t, src, "rev-parse", "HEAD")
+	run(t, src, "checkout", "-q", "-b", "foreman/7")
+	commit(t, src, "test: a", map[string]string{"a_test.go": "package a\n"})
+	commit(t, src, "feat: a", map[string]string{"a.go": "package a\n"})
+	run(t, src, "push", "-q", "origin", "foreman/7")
+	return base, run(t, src, "rev-parse", "HEAD")
+}
+
+func TestPrepareBranch(t *testing.T) {
+	bare := upstream(t)
+	base, tip := pushBranch(t, bare)
+	// The default branch moves on after the branch was made.
+	src := t.TempDir()
+	run(t, src, "clone", "-q", bare, ".")
+	commit(t, src, "config", map[string]string{".foreman.yml": "on trunk\n"})
+	run(t, src, "push", "-q", "origin", "HEAD:trunk")
+
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareBranch(context.Background(), repoID, 7, "foreman/7", 3, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, d.Workdir, "rev-parse", "HEAD"); got != tip {
+		t.Fatalf("HEAD = %s, want the branch tip %s", got, tip)
+	}
+	if string(d.ProjectFile) != "on trunk\n" {
+		t.Fatalf("ProjectFile = %q, want the default branch's", d.ProjectFile)
+	}
+	if err := scanForSecrets(d.Workdir, []string{testToken}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.PrepareBranch(context.Background(), repoID, 7, "foreman/7", 1, base); err == nil ||
+		!strings.Contains(err.Error(), "does not reach") {
+		t.Fatalf("too shallow: err = %v", err)
+	}
+}
+
+func TestSnapshotLeavesTheAgentsGitBehind(t *testing.T) {
+	bare := upstream(t)
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareDev(context.Background(), repoID, 7, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, d.Workdir, "test: a", map[string]string{"a_test.go": "package a\n"})
+	// What an agent could leave behind.
+	write(t, d.Workdir, "uncommitted.go", "package a\n")
+	marker := filepath.Join(t.TempDir(), "hook-ran")
+	write(t, d.Workdir, ".git/hooks/post-checkout", "#!/bin/sh\ntouch "+marker+"\n")
+	if err := os.Chmod(filepath.Join(d.Workdir, ".git/hooks/post-checkout"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run(t, d.Workdir, "config", "url.https://evil.example/.insteadOf", "file://")
+
+	dir, tip, err := w.Snapshot(context.Background(), repoID, 7, d.Workdir, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tip != run(t, d.Workdir, "rev-parse", "HEAD") {
+		t.Fatal("tip differs")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "uncommitted.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("uncommitted file crossed over")
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a hook from the agent's clone ran")
+	}
+	cfg, _ := os.ReadFile(filepath.Join(dir, ".git", "config"))
+	if strings.Contains(string(cfg), "evil") {
+		t.Errorf("agent config crossed over:\n%s", cfg)
+	}
+	if _, _, err := w.Snapshot(context.Background(), repoID, 7, d.Workdir, "missing"); err == nil {
+		t.Error("snapshot of a missing branch succeeded")
+	}
+}
+
+// fakeGit puts a git wrapper first in PATH that records its arguments and
+// whether it saw the auth header in its environment, then runs git.
+func fakeGit(t *testing.T) (log string) {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log = filepath.Join(t.TempDir(), "git.log")
+	script := "#!/bin/sh\n" +
+		"echo \"ARGS $*\" >> " + log + "\n" +
+		"env | grep '^GIT_CONFIG_VALUE_0=' | sed 's/^/ENV /' >> " + log + "\n" +
+		"exec " + gitPath + " \"$@\"\n"
+	write(t, bin, "git", script)
+	if err := os.Chmod(filepath.Join(bin, "git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return log
+}
+
+func TestPushTokenOnlyInEnv(t *testing.T) {
+	bare := upstream(t)
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareDev(context.Background(), repoID, 7, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, d.Workdir, "test: a", map[string]string{"a_test.go": "package a\n"})
+	dir, tip, err := w.Snapshot(context.Background(), repoID, 7, d.Workdir, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log := fakeGit(t)
+	if err := w.Push(context.Background(), repoID, dir, tip, "foreman/7", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, bare, "rev-parse", "refs/heads/foreman/7"); got != tip {
+		t.Fatalf("upstream branch = %s, want %s", got, tip)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawPush, sawHeader bool
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "ARGS") && strings.Contains(line, " push ") {
+			sawPush = true
+			if strings.Contains(line, "Authorization") || strings.Contains(line, "x-access-token") {
+				t.Errorf("credential on the command line: %s", line)
+			}
+		}
+		if strings.HasPrefix(line, "ENV GIT_CONFIG_VALUE_0=Authorization: Basic ") {
+			sawHeader = true
+		}
+	}
+	if !sawPush || !sawHeader {
+		t.Fatalf("push = %v, header in env = %v\n%s", sawPush, sawHeader, b)
+	}
+	basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + testToken))
+	for _, root := range []string{w.DataDir, bare} {
+		if err := scanForSecrets(root, []string{testToken, basic}); err != nil {
+			t.Errorf("%s: %v", root, err)
+		}
+	}
+}
+
+func TestPushFastForwardOnly(t *testing.T) {
+	bare := upstream(t)
+	pushBranch(t, bare)
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareDev(context.Background(), repoID, 7, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, d.Workdir, "test: other", map[string]string{"b_test.go": "package b\n"})
+	dir, tip, err := w.Snapshot(context.Background(), repoID, 7, d.Workdir, "foreman/7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Push(context.Background(), repoID, dir, tip, "foreman/7", false); err == nil {
+		t.Fatal("a non-fast-forward push was accepted")
+	}
+	if err := w.Push(context.Background(), repoID, dir, tip, "foreman/7", true); err != nil {
+		t.Fatalf("forced push: %v", err)
 	}
 }
