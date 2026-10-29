@@ -33,6 +33,10 @@ type fixture struct {
 	engine *orchestrator.Engine
 	now    func() time.Time
 	ws     *fakeWorkspace
+	// workspace replaces ws when set: a real one, for development, over
+	// the bare upstream repository.
+	workspace orchestrator.Workspace
+	bare      string
 	// skew is added to foreman's clock only, not to GitHub's.
 	skew time.Duration
 }
@@ -71,6 +75,10 @@ func (fx *fixture) restart() {
 	}
 	fx.t.Cleanup(func() { _ = db.Close() })
 	fx.db = db
+	var ws orchestrator.Workspace = fx.ws
+	if fx.workspace != nil {
+		ws = fx.workspace
+	}
 	fx.engine = orchestrator.New(orchestrator.Deps{
 		Config: config.Config{
 			Repos: []config.Repo{repo}, AuthorizedUsers: []string{owner},
@@ -78,10 +86,17 @@ func (fx *fixture) restart() {
 		},
 		GitHub:    fx.gh,
 		Store:     db,
-		Workspace: fx.ws,
+		Workspace: ws,
 		Agent:     fx.agent,
+		Developer: fx.agent,
 		Now:       func() time.Time { return fx.now().Add(fx.skew) },
 	})
+	if fx.workspace == nil {
+		// Qualification tests stop at queued.
+		fx.engine.Register(store.Queued, orchestrator.HandlerFunc(func(context.Context, *orchestrator.Case) (*orchestrator.Transition, error) {
+			return nil, nil
+		}))
+	}
 	if err := fx.engine.Start(context.Background()); err != nil {
 		fx.t.Fatal(err)
 	}
@@ -563,7 +578,8 @@ func TestStartCreatesLabels(t *testing.T) {
 	fx := newFixture(t)
 	got := fx.gh.labels[repo.String()]
 	for _, want := range []string{"foreman", "foreman:qualifying", "foreman:needs-info", "foreman:awaiting-go",
-		"foreman:queued", "foreman:blocked", "foreman:suspect", "go", "no-go"} {
+		"foreman:queued", "foreman:blocked", "foreman:suspect", "go", "no-go",
+		"foreman:in-progress", "foreman:in-review", "foreman:merged", "foreman:high-risk"} {
 		if !slices.Contains(got, want) {
 			t.Errorf("label %q not created", want)
 		}
@@ -645,22 +661,6 @@ func TestRestartRequalifiesAnInterruptedQualification(t *testing.T) {
 	}
 }
 
-func TestQueuedHasNoHandlerYet(t *testing.T) {
-	fx := newFixture(t)
-	fx.toAwaitingGo()
-	fx.gh.label("go", owner)
-	fx.tick()
-	called := 0
-	fx.engine.Register(store.Queued, orchestrator.HandlerFunc(func(context.Context, *orchestrator.Case) (*orchestrator.Transition, error) {
-		called++
-		return nil, nil
-	}))
-	fx.tick()
-	if called != 1 || fx.state() != store.Queued {
-		t.Fatalf("registered queued handler called %d times", called)
-	}
-}
-
 // The go must be newer than the comment announcing awaiting-go, on
 // GitHub's clock: foreman's own clock does not matter.
 func TestGoComparedOnGitHubClock(t *testing.T) {
@@ -706,7 +706,7 @@ func TestWorkspaceFailuresAreRetriedThenBlock(t *testing.T) {
 		t.Fatalf("state = %q, want blocked", s)
 	}
 	last := fx.gh.botComments()[len(fx.gh.botComments())-1]
-	if !strings.Contains(last, "5 times in a row") || !strings.Contains(last, "could not resolve host (left 0)") {
+	if !strings.Contains(last, "could not prepare a workspace 5 times in a row") || !strings.Contains(last, "could not resolve host (left 0)") {
 		t.Fatalf("comment = %q", last)
 	}
 	if fx.agent.calls() != 0 {
