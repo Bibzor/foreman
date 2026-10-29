@@ -26,6 +26,7 @@ const (
 	maxSection = 25000
 	maxDetail  = 3000
 	maxDiff    = 200000
+	maxNotes   = 10000
 )
 
 // Branch is the branch foreman develops an issue on.
@@ -232,18 +233,29 @@ func prTitle(s qualify.Snapshot) string {
 	return t
 }
 
-// prBody is the plan, the review guide and a reference to the issue.
-// "Refs", never "Closes": the issue stays open until acceptance.
+// prBody is the plan, the review guide, the agent's notes and a reference
+// to the issue. "Refs", never "Closes": the issue stays open until
+// acceptance.
 func prBody(c *Case, s qualify.Snapshot, p project.Config, res develop.Result) string {
 	var b strings.Builder
 	b.WriteString(qualify.Markdown(res.Plan, maxSection))
 	b.WriteString("\n\n")
 	b.WriteString(qualify.Markdown(res.ReviewGuide, maxSection))
+	b.WriteString(agentNotes(res))
 	fmt.Fprintf(&b, "\n\n---\n\nRefs #%d\n\n", s.Number)
 	fmt.Fprintf(&b, "_Developed by foreman from the approved snapshot of #%d (sha256 `%s`). "+
 		"foreman checked the branch itself: tests committed first, no protected path, at most %d changed lines, "+
 		"`%s` and `%s` pass._", s.Number, c.Issue.SnapshotSHA, p.MaxDiffLines, p.Test, p.Lint)
 	return b.String()
+}
+
+// agentNotes renders the text the agent wrote before its JSON object as
+// a quoted, untrusted block: none of its markup is rendered.
+func agentNotes(res develop.Result) string {
+	if strings.TrimSpace(res.Notes) == "" {
+		return ""
+	}
+	return "\n\n## Agent notes\n\n_Written by the agent, shown as plain text._\n\n" + qualify.Fenced(res.Notes, maxNotes)
 }
 
 // inReview follows the pull request: merged, closed, pre-review, and
@@ -469,6 +481,7 @@ func revisionComment(what string, rv github.Review, res develop.Result, changes 
 		b.WriteString("\n\n")
 		b.WriteString(qualify.Markdown(res.ReviewGuide, maxSection))
 	}
+	b.WriteString(agentNotes(res))
 	if len(risks) > 0 {
 		fmt.Fprintf(&b, "\n\n### Deterministic checks\n\nThis revision touches sensitive files, labeled `%s`:\n", LabelHighRisk)
 		for _, r := range risks {

@@ -72,7 +72,7 @@ func Prompt(req Request) string {
 		b.WriteString("</untrusted_review>\n")
 	}
 
-	b.WriteString("\n## Output\n\nEnd with only this JSON object, nothing after it:\n")
+	b.WriteString("\n## Output\n\nYou may first write notes for the reviewer. End with this JSON object, nothing after it:\n")
 	b.WriteString(`{"status": "done" or "failed", "plan": "...", "review_guide": "...", "failure_report": "..."}` + "\n")
 	if req.Review == nil {
 		b.WriteString("- done: the tests pass. plan is the foreman-plan output, review_guide the foreman-review-guide output, " +
