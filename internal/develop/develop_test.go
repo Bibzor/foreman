@@ -136,3 +136,30 @@ func TestRisky(t *testing.T) {
 		}
 	}
 }
+
+func TestParseKeepsNotes(t *testing.T) {
+	obj := `{"status": "done", "plan": "## Summary", "review_guide": "## Review guide", "failure_report": ""}`
+	tests := map[string]struct{ text, notes string }{
+		"prose then JSON":        {"Committed tests, then the handler.\nmake test passes.\n\n" + obj, "Committed tests, then the handler.\nmake test passes."},
+		"prose then fenced JSON": {"All green.\n\n```json\n" + obj + "\n```\n", "All green."},
+		"JSON only":              {obj, ""},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			r, err := develop.Parse(tt.text)
+			if err != nil || r.Notes != tt.notes || r.Status != develop.Done {
+				t.Fatalf("r = %+v, %v; want notes %q", r, err, tt.notes)
+			}
+		})
+	}
+	if _, err := develop.Parse("I did everything, tests and lint are green."); err == nil {
+		t.Fatal("output without JSON accepted")
+	}
+	if _, err := develop.Parse("Notes.\n" + `{"status": "done", "plan": "p", "review_guide": "g", "failure_report": "", "Notes": "x"}`); err == nil {
+		t.Fatal("a Notes key in the JSON was accepted")
+	}
+	// Pre-review output may carry prose too.
+	if r, err := develop.ParsePreReview("Reviewed.\n" + `{"report": "## Pre-review", "findings": []}`); err != nil || r.Report != "## Pre-review" {
+		t.Fatalf("pre-review with prose: %+v %v", r, err)
+	}
+}

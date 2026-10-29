@@ -174,10 +174,13 @@ func TestParse(t *testing.T) {
 
 	edit := func(from, to string) string { return strings.Replace(validJSON, from, to, 1) }
 	tests := []struct{ name, text, want string }{
+		{"invalid final object after prose", "Notes.\n" + edit(`"S"`, `"XL"`), `size "XL"`},
 		{"empty", "", "not the expected JSON object"},
-		{"prose", "Here is the result: " + validJSON, "not the expected JSON object"},
+		{"prose only", "I looked at the issue and it is ready.", "not the expected JSON object"},
+		{"prose with braces only", "Use {x} and {y}.", "not the expected JSON object"},
 		{"trailing text", validJSON + "\nHope this helps", "text after"},
-		{"two objects", validJSON + validJSON, "text after"},
+		{"fence then text", "```json\n" + validJSON + "\n```\nDone.", "not the expected JSON object"},
+		{"unterminated fence in notes", "```json\n" + validJSON, "unterminated"},
 		{"bad fence lang", "```yaml\n" + validJSON + "\n```", "fence language"},
 		{"unterminated fence", "```json\n" + validJSON, "unterminated"},
 		{"unknown key", edit(`"size"`, `"extra": 1, "size"`), "unknown field"},
@@ -242,6 +245,35 @@ func TestQuoteTruncates(t *testing.T) {
 	q := qualify.Quote(qualify.Snapshot{Body: strings.Repeat("é", 30000)})
 	if len(q) > 41000 || !strings.Contains(q, "[... truncated]") {
 		t.Fatalf("len %d", len(q))
+	}
+}
+
+// Free text may precede the final JSON object; the last top-level object
+// wins and is still validated strictly.
+func TestDecodeStrictNotes(t *testing.T) {
+	other := strings.Replace(validJSON, `"S"`, `"M"`, 1)
+	tests := []struct {
+		name, text, notes, size string
+	}{
+		{"prose then JSON", "I read AGENTS.md.\nAll good.\n\n" + validJSON + "\n", "I read AGENTS.md.\nAll good.", "S"},
+		{"prose then fenced JSON", "Summary:\n- did things\n```go\nfunc x() {}\n```\n\n```json\n" + validJSON + "\n```",
+			"Summary:\n- did things\n```go\nfunc x() {}\n```", "S"},
+		{"two objects, the last wins", other + "\nActually:\n" + validJSON, other + "\nActually:", "S"},
+		{"two adjacent objects", validJSON + other, validJSON, "M"},
+		{"nested braces in notes", "Shape: {\"a\": {\"b\": 1}}\n" + validJSON, "Shape: {\"a\": {\"b\": 1}}", "S"},
+		{"bare fence", "```\n" + validJSON + "\n```", "", "S"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var r qualify.Result
+			notes, err := qualify.DecodeStrict(tt.text, &r, []string{"decision", "size"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if notes != tt.notes || r.Size != tt.size {
+				t.Fatalf("notes = %q, size = %q; want %q, %q", notes, r.Size, tt.notes, tt.size)
+			}
+		})
 	}
 }
 

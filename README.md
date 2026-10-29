@@ -86,13 +86,13 @@ pack foreman ships, otherwise: "project pins X, foreman ships Y".
 Created on start when missing: `foreman` (opt-in), `foreman:qualifying`,
 `foreman:needs-info`, `foreman:awaiting-go`, `foreman:queued`,
 `foreman:in-progress`, `foreman:in-review`, `foreman:merged`,
-`foreman:blocked`, `foreman:suspect`, `go`, `no-go`, and
+`foreman:blocked`, `foreman:suspect`, `go`, `no-go`, `retry`, and
 `foreman:high-risk`, which goes on pull requests.
 
 A label counts only if the latest `labeled` event for it is by an
 authorized user. Otherwise foreman ignores it and says so in one comment.
-`go` and `no-go` must also be added after the comment that announced the
-current state, both times taken from GitHub's clock. The `foreman:*`
+`go`, `no-go` and `retry` must also be added after the comment that
+announced the current state, both times taken from GitHub's clock. The `foreman:*`
 label of an issue mirrors the state stored in the database
 (`data_dir/foreman.db`), which is the source of truth.
 
@@ -129,6 +129,8 @@ label of an issue mirrors the state stored in the database
              |     +--- PR closed without merge --------> blocked
              v
            merged  (the issue stays open until acceptance)
+
+           blocked --retry (authorized)--> the state it was blocked from
 ```
 
 - **qualifying**: fresh shallow clone, skills installed and verified,
@@ -157,7 +159,8 @@ label of an issue mirrors the state stored in the database
   trusted input, and follows `foreman-plan`, `foreman-tdd`,
   `foreman-fix-loop` and `foreman-review-guide`. It ends with a JSON
   object `{status, plan, review_guide, failure_report}`, validated like
-  the qualification output. Then foreman checks the branch itself,
+  the qualification output. Text it writes before that object goes to the
+  PR under "Agent notes", quoted as untrusted plain text. Then foreman checks the branch itself,
   without trusting the agent; any failure blocks the issue and names the
   check:
   1. `commit-order`: the branch starts with `test:` commits that touch
@@ -185,6 +188,16 @@ label of an issue mirrors the state stored in the database
     change existing tests only in `test:` commits that touch test files
     only, and the comment lists every test file changed. A third request
     for changes blocks the issue. Reviews by anyone else are ignored.
+
+- **blocked**: a human looks at the reason in the comment. When the cause
+  is fixed, an authorized user adds `retry`: the issue goes back to the
+  state it was blocked from and runs that step again from a fresh
+  workspace, and the label is removed. A `retry` from anyone else, or
+  added before the issue was blocked, is ignored.
+
+Agent output (qualification, development, pre-review) may start with
+free text. foreman takes the last top-level JSON object, bare or in a
+final `json` fence, with nothing after it, and validates it strictly.
 
 Every transition is stored with a timestamp and a reason and posts one
 comment. GitHub side effects, opening the PR included, go through an
