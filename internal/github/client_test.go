@@ -297,3 +297,61 @@ func TestParseKey(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestPullRequests(t *testing.T) {
+	f := newFakeAPI(t)
+	f.mux.HandleFunc("POST /repos/Bibzor/demo-api/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if !f.requireToken(w, r) {
+			return
+		}
+		var in map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Error(err)
+		}
+		if in["head"] != "foreman/7" || in["base"] != "main" || in["title"] != "Add a version endpoint" || in["body"] != "Refs #7" {
+			t.Errorf("create = %v", in)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"number": 12}`))
+	})
+	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls", func(w http.ResponseWriter, r *http.Request) {
+		if q := r.URL.Query(); q.Get("head") != "Bibzor:foreman/7" || q.Get("state") != "all" {
+			t.Errorf("query = %s", r.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte(`[{"number": 12, "state": "closed", "merged_at": "2026-10-28T10:00:00Z", "body": "x", "head": {"ref": "foreman/7"}}]`))
+	})
+	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls/12", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"number": 12, "state": "open", "merged": false, "body": null, "commits": 3, "head": {"ref": "foreman/7"}}`))
+	})
+	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls/12/reviews", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[
+			{"id": 1, "user": {"login": "Bibzor"}, "state": "CHANGES_REQUESTED", "body": "fix it", "submitted_at": "2026-10-28T10:00:00Z"},
+			{"id": 2, "user": null, "state": "APPROVED"}
+		]`))
+	})
+	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls/12/reviews/1/comments", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"path": "main.go", "line": 4, "body": "rename"}, {"path": "old.go", "line": null, "body": "outdated"}]`))
+	})
+	c := f.client(func() time.Time { return f.expiresAt.Add(-time.Hour) })
+	ctx := context.Background()
+
+	if n, err := c.CreatePullRequest(ctx, repo, "foreman/7", "main", "Add a version endpoint", "Refs #7"); err != nil || n != 12 {
+		t.Fatalf("CreatePullRequest = %d %v", n, err)
+	}
+	prs, err := c.PullRequestsByHead(ctx, repo, "foreman/7")
+	if err != nil || len(prs) != 1 || prs[0].Open || !prs[0].Merged || prs[0].Head != "foreman/7" {
+		t.Fatalf("PullRequestsByHead = %+v %v", prs, err)
+	}
+	pr, err := c.PullRequest(ctx, repo, 12)
+	if err != nil || !pr.Open || pr.Merged || pr.Commits != 3 || pr.Body != "" {
+		t.Fatalf("PullRequest = %+v %v", pr, err)
+	}
+	reviews, err := c.Reviews(ctx, repo, 12)
+	if err != nil || len(reviews) != 1 || reviews[0].State != "CHANGES_REQUESTED" || reviews[0].Author != "Bibzor" {
+		t.Fatalf("Reviews = %+v %v", reviews, err)
+	}
+	comments, err := c.ReviewComments(ctx, repo, 12, 1)
+	if err != nil || len(comments) != 2 || comments[0].Line != 4 || comments[1].Path != "old.go" {
+		t.Fatalf("ReviewComments = %+v %v", comments, err)
+	}
+}
