@@ -63,7 +63,7 @@ func TestQualifyCommandLineAndEnv(t *testing.T) {
 		t.Errorf("dir = %q", got.dir)
 	}
 	want := []string{
-		"-p", "--output-format", "json", "--tools", "Read,Grep,Glob,Skill", "--allowedTools", "Read,Grep,Glob,Skill",
+		"-p", "--output-format", "json", "--tools", "Read,Grep,Glob,Skill", "--allowedTools", "Read", "Grep", "Glob", "Skill",
 		"--permission-mode", "dontAsk", "--restricted", "--strict-mcp-config", "--no-session-persistence",
 		"--max-turns", "12", "--plugin-dir", "/data/skills/o/r/1",
 	}
