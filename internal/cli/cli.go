@@ -25,6 +25,7 @@ const (
 )
 
 const usage = `Usage:
+  foreman run [--config <path>] [--once]
   foreman skills install [--agent claude] --target <repo>
   foreman skills verify --target <repo>
   foreman skills list
@@ -66,6 +67,8 @@ func dispatch(args []string, stdout, stderr io.Writer) error {
 		}
 		_, err := fmt.Fprintf(stdout, "foreman %s\n", version.Version)
 		return err
+	case "run":
+		return run(args[1:], stderr)
 	case "skills":
 		if len(args) < 2 {
 			return fmt.Errorf("%w: missing skills command", errUsage)

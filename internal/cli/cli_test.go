@@ -96,3 +96,38 @@ func TestInstallDefaultsToClaude(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestRunCommand(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "app.pem")
+	if err := os.WriteFile(keyPath, []byte("not a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(dir, "config.yml")
+	body := "app_id: 1\nprivate_key_path: " + keyPath + "\nrepos: [\"Bibzor/demo-api\"]\nauthorized_users: [\"Bibzor\"]\ndata_dir: " + dir + "\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name       string
+		args       []string
+		wantCode   int
+		wantStderr string
+	}{
+		{"extra arg", []string{"run", "now"}, 2, "unexpected argument"},
+		{"bad flag", []string{"run", "--loop"}, 2, "flag provided but not defined"},
+		{"missing config", []string{"run", "--once", "--config", filepath.Join(dir, "nope.yml")}, 1, "read config"},
+		{"invalid key", []string{"run", "--once", "--config", cfg}, 1, "private key: no PEM block"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			code, _, stderr := run(tt.args...)
+			if code != tt.wantCode || !strings.Contains(stderr, tt.wantStderr) {
+				t.Fatalf("code %d, stderr %q", code, stderr)
+			}
+			if strings.Contains(stderr, "not a key") {
+				t.Fatal("key file content printed")
+			}
+		})
+	}
+}
