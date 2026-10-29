@@ -37,6 +37,9 @@ func TestParseDefaults(t *testing.T) {
 	if c.PollInterval != 30*time.Second {
 		t.Errorf("PollInterval = %s", c.PollInterval)
 	}
+	if c.WIPLimit != 2 {
+		t.Errorf("WIPLimit = %d", c.WIPLimit)
+	}
 	if len(c.Repos) != 2 || c.Repos[1].String() != "Bibzor/demo-web" {
 		t.Errorf("Repos = %v", c.Repos)
 	}
@@ -46,12 +49,12 @@ func TestParseDefaults(t *testing.T) {
 }
 
 func TestParseOverrides(t *testing.T) {
-	c, err := config.Parse([]byte(valid + "poll_interval: 5m\ndata_dir: /var/lib/foreman\n"))
+	c, err := config.Parse([]byte(valid + "poll_interval: 5m\ndata_dir: /var/lib/foreman\nwip_limit: 5\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.PollInterval != 5*time.Minute || c.DataDir != "/var/lib/foreman" {
-		t.Errorf("got %s %q", c.PollInterval, c.DataDir)
+	if c.PollInterval != 5*time.Minute || c.DataDir != "/var/lib/foreman" || c.WIPLimit != 5 {
+		t.Errorf("got %s %q %d", c.PollInterval, c.DataDir, c.WIPLimit)
 	}
 }
 
@@ -70,6 +73,7 @@ func TestParseInvalid(t *testing.T) {
 		{"bad login", strings.Replace(valid, `["Bibzor"]`, `["a b"]`, 1), "is not a GitHub login"},
 		{"bad interval", valid + "poll_interval: soon\n", "poll_interval"},
 		{"tiny interval", valid + "poll_interval: 1ms\n", "below 1s"},
+		{"zero wip limit", valid + "wip_limit: 0\n", "wip_limit: 0 is below 1"},
 		{"relative data dir", valid + "data_dir: data\n", "must be absolute"},
 	}
 	for _, tt := range tests {
