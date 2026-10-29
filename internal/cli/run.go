@@ -65,12 +65,18 @@ func run(args []string, stderr io.Writer) error {
 			Version: skills.PackVersion,
 		},
 		Agent: claudecode.Qualifier{Claude: &claudecode.Claude{}},
-		Log:   log,
+		Developer: claudecode.Developer{
+			Claude:  &claudecode.Claude{},
+			GitName: "foreman", GitEmail: "foreman@users.noreply.github.com",
+		},
+		Log: log,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Info("foreman starting", "version", version.Version, "repos", len(cfg.Repos), "once", once)
+	log.Info("foreman starting", "version", version.Version, "skills", skills.PackVersion, "repos", len(cfg.Repos),
+		"wip_limit", cfg.WIPLimit, "once", once)
+	log.Warn("project test and lint commands run code written by the agent on this host, as this user, without isolation")
 	if !once {
 		return engine.Run(ctx)
 	}
