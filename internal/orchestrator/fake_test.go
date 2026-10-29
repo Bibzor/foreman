@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Bibzor/foreman/internal/config"
+	"github.com/Bibzor/foreman/internal/develop"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/qualify"
 	"github.com/Bibzor/foreman/internal/workspace"
@@ -28,6 +29,17 @@ type fakeGitHub struct {
 	failComments int // CreateComment fails this many times (after posting when postThenFail)
 	postThenFail bool
 	created      int // comments created by the bot
+
+	prs          map[string]*fakePR // "owner/name#n"
+	nextPR       int
+	failCreatePR int // CreatePullRequest creates the PR, then fails, this many times
+}
+
+type fakePR struct {
+	github.PullRequest
+	base, title string
+	reviews     []github.Review
+	comments    map[int64][]github.ReviewComment
 }
 
 type fakeIssue struct {
@@ -37,7 +49,8 @@ type fakeIssue struct {
 }
 
 func newFakeGitHub(now func() time.Time) *fakeGitHub {
-	return &fakeGitHub{now: now, issues: map[string]*fakeIssue{}, labels: map[string][]string{}, nextID: 1000}
+	return &fakeGitHub{now: now, issues: map[string]*fakeIssue{}, labels: map[string][]string{}, nextID: 1000,
+		prs: map[string]*fakePR{}, nextPR: 100}
 }
 
 func key(repo config.Repo, n int) string { return fmt.Sprintf("%s#%d", repo, n) }
@@ -60,10 +73,12 @@ func (f *fakeGitHub) open(repo config.Repo, n int, author, title, body string) {
 	f.issues[key(repo, n)] = &fakeIssue{Issue: github.Issue{Number: n, Title: title, Body: body, Author: author, Open: true}}
 }
 
-func (f *fakeGitHub) label(name, actor string) {
+func (f *fakeGitHub) label(name, actor string) { f.labelOn(n, name, actor) }
+
+func (f *fakeGitHub) labelOn(num int, name, actor string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	is := f.issues[key(repo, n)]
+	is := f.issues[key(repo, num)]
 	if !is.HasLabel(name) {
 		is.Labels = append(is.Labels, name)
 	}
@@ -89,11 +104,13 @@ func (f *fakeGitHub) closeByHuman() {
 	f.issues[key(repo, n)].Open = false
 }
 
-func (f *fakeGitHub) botComments() []string {
+func (f *fakeGitHub) botComments() []string { return f.botCommentsOn(n) }
+
+func (f *fakeGitHub) botCommentsOn(num int) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []string
-	for _, c := range f.issues[key(repo, n)].comments {
+	for _, c := range f.issues[key(repo, num)].comments {
 		if c.Author == bot {
 			out = append(out, c.Body)
 		}
@@ -107,6 +124,48 @@ func (f *fakeGitHub) issue() github.Issue {
 	is := f.issues[key(repo, n)].Issue
 	is.Labels = slices.Clone(is.Labels)
 	return is
+}
+
+// pr returns the only pull request, or nil.
+func (f *fakeGitHub) pr() *fakePR {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.prs) != 1 {
+		return nil
+	}
+	for _, p := range f.prs {
+		cp := *p
+		return &cp
+	}
+	return nil
+}
+
+func (f *fakeGitHub) prLabels(num int) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.issues[key(repo, num)].Labels)
+}
+
+func (f *fakeGitHub) mergePR(num int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.prs[key(repo, num)]
+	p.Open, p.Merged = false, true
+}
+
+func (f *fakeGitHub) closePR(num int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.prs[key(repo, num)].Open = false
+}
+
+func (f *fakeGitHub) review(num int, author, state, body string, comments ...github.ReviewComment) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.prs[key(repo, num)]
+	id := f.id()
+	p.reviews = append(p.reviews, github.Review{ID: id, Author: author, State: state, Body: body, SubmittedAt: f.now()})
+	p.comments[id] = comments
 }
 
 // GitHub interface.
@@ -226,11 +285,131 @@ func (f *fakeGitHub) CloseIssue(_ context.Context, repo config.Repo, n int) erro
 	return nil
 }
 
+func (f *fakeGitHub) CreatePullRequest(_ context.Context, repo config.Repo, head, base, title, body string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, p := range f.prs {
+		if strings.HasPrefix(k, repo.String()+"#") && p.Open && p.Head == head {
+			return 0, &github.APIError{Status: 422, Message: "A pull request already exists for " + head}
+		}
+	}
+	f.nextPR++
+	num := f.nextPR
+	f.prs[key(repo, num)] = &fakePR{
+		PullRequest: github.PullRequest{Number: num, Open: true, Head: head, Body: body, Commits: 50},
+		base:        base, title: title, comments: map[int64][]github.ReviewComment{},
+	}
+	f.issues[key(repo, num)] = &fakeIssue{Issue: github.Issue{Number: num, Title: title, Body: body, Author: bot, Open: true}}
+	if f.failCreatePR > 0 {
+		f.failCreatePR--
+		return 0, errors.New("connection reset after the pull request was created")
+	}
+	return num, nil
+}
+
+func (f *fakeGitHub) PullRequestsByHead(_ context.Context, repo config.Repo, branch string) ([]github.PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []github.PullRequest
+	for k, p := range f.prs {
+		if strings.HasPrefix(k, repo.String()+"#") && p.Head == branch {
+			out = append(out, p.PullRequest)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeGitHub) PullRequest(_ context.Context, repo config.Repo, num int) (github.PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.prs[key(repo, num)]
+	if !ok {
+		return github.PullRequest{}, &github.APIError{Status: 404, Message: "Not Found"}
+	}
+	return p.PullRequest, nil
+}
+
+func (f *fakeGitHub) Reviews(_ context.Context, repo config.Repo, num int) ([]github.Review, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.prs[key(repo, num)].reviews), nil
+}
+
+func (f *fakeGitHub) ReviewComments(_ context.Context, repo config.Repo, num int, id int64) ([]github.ReviewComment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.prs[key(repo, num)].comments[id]), nil
+}
+
 // fakeAgent returns scripted answers in order.
 type fakeAgent struct {
 	mu       sync.Mutex
 	answers  []answer
 	requests []qualify.Request
+
+	devAnswers []devAnswer
+	devReqs    []develop.Request
+	preAnswers []preAnswer
+	preReqs    []develop.PreReviewRequest
+}
+
+// devAnswer is a scripted development run: work runs in the workdir, as
+// the agent would, then res and err are returned.
+type devAnswer struct {
+	work func(dir string)
+	res  develop.Result
+	err  error
+}
+
+type preAnswer struct {
+	res develop.PreReviewResult
+	err error
+}
+
+func (a *fakeAgent) pushDev(ans ...devAnswer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.devAnswers = append(a.devAnswers, ans...)
+}
+
+func (a *fakeAgent) pushPre(ans ...preAnswer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.preAnswers = append(a.preAnswers, ans...)
+}
+
+func (a *fakeAgent) Develop(_ context.Context, req develop.Request) (develop.Result, error) {
+	a.mu.Lock()
+	a.devReqs = append(a.devReqs, req)
+	if len(a.devAnswers) == 0 {
+		a.mu.Unlock()
+		return develop.Result{}, errors.New("fake agent: no scripted development")
+	}
+	ans := a.devAnswers[0]
+	a.devAnswers = a.devAnswers[1:]
+	a.mu.Unlock()
+	if ans.work != nil {
+		ans.work(req.Workdir)
+	}
+	return ans.res, ans.err
+}
+
+func (a *fakeAgent) PreReview(_ context.Context, req develop.PreReviewRequest) (develop.PreReviewResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.preReqs = append(a.preReqs, req)
+	if len(a.preAnswers) == 0 {
+		return develop.PreReviewResult{}, errors.New("fake agent: no scripted pre-review")
+	}
+	ans := a.preAnswers[0]
+	a.preAnswers = a.preAnswers[1:]
+	return ans.res, ans.err
+}
+
+func (a *fakeAgent) devCalls() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.devReqs)
 }
 
 type answer struct {
@@ -277,6 +456,24 @@ func (w *fakeWorkspace) Prepare(_ context.Context, repo config.Repo, n int) (wor
 		return workspace.Dirs{}, fmt.Errorf("git clone: exit status 128: could not resolve host (left %d)", w.fail)
 	}
 	return workspace.Dirs{Workdir: fmt.Sprintf("%s/work/%s/%d", w.dir, repo, n), SkillsDir: w.dir + "/skills"}, nil
+}
+
+var errNoGit = errors.New("fake workspace: no git")
+
+func (w *fakeWorkspace) PrepareDev(context.Context, config.Repo, int, string) (workspace.Dirs, error) {
+	return workspace.Dirs{}, errNoGit
+}
+
+func (w *fakeWorkspace) PrepareBranch(context.Context, config.Repo, int, string, int, string) (workspace.Dirs, error) {
+	return workspace.Dirs{}, errNoGit
+}
+
+func (w *fakeWorkspace) Snapshot(context.Context, config.Repo, int, string, string) (string, string, error) {
+	return "", "", errNoGit
+}
+
+func (w *fakeWorkspace) Push(context.Context, config.Repo, string, string, string, bool) error {
+	return errNoGit
 }
 
 // Scripted agent answers.

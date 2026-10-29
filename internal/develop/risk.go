@@ -4,6 +4,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/Bibzor/foreman/internal/qualify"
 )
 
 // dependencyFiles are manifests and lockfiles, by base name.
@@ -26,9 +28,9 @@ func Risky(paths []string) []string {
 	for _, p := range paths {
 		switch {
 		case dependencyFiles.MatchString(path.Base(p)):
-			out = append(out, "`"+p+"` is a dependency file")
+			out = append(out, Code(p)+" is a dependency file")
 		case anySegment(p):
-			out = append(out, "`"+p+"` looks related to authentication or access control")
+			out = append(out, Code(p)+" looks related to authentication or access control")
 		}
 	}
 	return out
@@ -41,4 +43,10 @@ func anySegment(p string) bool {
 		}
 	}
 	return false
+}
+
+// Code renders a path for a comment as a code span it cannot break out
+// of, with invisible characters shown.
+func Code(s string) string {
+	return "`" + strings.ReplaceAll(qualify.MakeVisible(s), "`", "'") + "`"
 }
