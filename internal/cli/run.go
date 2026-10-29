@@ -62,7 +62,7 @@ func run(args []string, stderr io.Writer) error {
 			DataDir: cfg.DataDir,
 			Tokens:  gh,
 			Skills:  skills.FS,
-			Version: version.Version,
+			Version: skills.PackVersion,
 		},
 		Agent: claudecode.Qualifier{Claude: &claudecode.Claude{}},
 		Log:   log,
