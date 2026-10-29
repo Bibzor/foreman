@@ -102,45 +102,51 @@ var resultKeys = []string{
 	"size", "touches", "risks", "suspicious", "suspicious_reasons",
 }
 
-// Parse extracts the JSON object from the agent's final text (bare, or in
-// a single ```json fence) and validates it against the foreman-qualify
-// output shape: every key present, no other key, right types and values.
+// Parse extracts the JSON object from the agent's final text and
+// validates it against the foreman-qualify output shape.
 func Parse(text string) (Result, error) {
+	var r Result
+	if err := DecodeStrict(text, &r, resultKeys); err != nil {
+		return Result{}, err
+	}
+	return r, r.validate()
+}
+
+// DecodeStrict extracts the JSON object from an agent's final text (bare,
+// or in a single ```json fence) and decodes it into v: every key of keys
+// present and not null, no other key, right types.
+func DecodeStrict(text string, v any, keys []string) error {
 	body := strings.TrimSpace(text)
 	if strings.HasPrefix(body, "```") {
 		nl := strings.IndexByte(body, '\n')
 		if nl < 0 || !strings.HasSuffix(body, "```") || len(body) < nl+4 {
-			return Result{}, errors.New("unterminated code fence")
+			return errors.New("unterminated code fence")
 		}
 		if lang := strings.TrimSpace(body[3:nl]); lang != "" && lang != "json" {
-			return Result{}, fmt.Errorf("code fence language %q", lang)
+			return fmt.Errorf("code fence language %q", lang)
 		}
 		body = strings.TrimSpace(body[nl+1 : len(body)-3])
 	}
 
-	var keys map[string]json.RawMessage
-	if err := strictDecode(body, &keys); err != nil {
-		return Result{}, err
+	var got map[string]json.RawMessage
+	if err := strictDecode(body, &got); err != nil {
+		return err
 	}
 	var errs []error
-	for _, k := range resultKeys {
-		if _, ok := keys[k]; !ok {
+	for _, k := range keys {
+		if _, ok := got[k]; !ok {
 			errs = append(errs, fmt.Errorf("missing %q", k))
 		}
 	}
-	var r Result
-	if err := strictDecode(body, &r); err != nil {
+	if err := strictDecode(body, v); err != nil {
 		errs = append(errs, err)
 	}
-	for k, v := range keys {
-		if string(v) == "null" {
+	for k, raw := range got {
+		if string(raw) == "null" {
 			errs = append(errs, fmt.Errorf("%q is null", k))
 		}
 	}
-	if err := errors.Join(errs...); err != nil {
-		return Result{}, err
-	}
-	return r, r.validate()
+	return errors.Join(errs...)
 }
 
 func strictDecode(s string, v any) error {

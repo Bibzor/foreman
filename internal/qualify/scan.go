@@ -36,8 +36,8 @@ func invisible(r rune) bool { return hidden(r) || unicode.Is(unicode.Cf, r) }
 
 var (
 	b64Run  = regexp.MustCompile(`[A-Za-z0-9+/_-]{60,}={0,2}`)
-	tagName = regexp.MustCompile(`(?i)untrusted_issue`)
-	tagLike = regexp.MustCompile(`(?i)<[\s/]*untrusted_issue[^<>]*>`)
+	tagName = regexp.MustCompile(`(?i)untrusted_(issue|review|diff)`)
+	tagLike = regexp.MustCompile(`(?i)<[\s/]*untrusted_(issue|review|diff)[^<>]*>`)
 )
 
 // minB64Run is the shortest piece between slashes counted as encoded.
@@ -128,13 +128,18 @@ func MakeVisible(s string) string {
 	return b.String()
 }
 
-// Neutralize makes sure s cannot open or close the <untrusted_issue>
-// block: tag-like sequences are replaced, then any remaining occurrence
-// of the name, in any case, is renamed. Run it after MakeVisible, so a
+// Neutralize makes sure s cannot open or close an <untrusted_issue>,
+// <untrusted_review> or <untrusted_diff> block: tag-like sequences are
+// replaced, then any remaining occurrence of a name, in any case, is
+// renamed. Run it after MakeVisible, so a
 // name split by invisible characters is already broken up visibly.
 func Neutralize(s string) string {
-	s = tagLike.ReplaceAllString(s, "[removed tag: untrusted-issue]")
-	return tagName.ReplaceAllString(s, "untrusted-issue")
+	s = tagLike.ReplaceAllStringFunc(s, func(m string) string {
+		return "[removed tag: untrusted-" + strings.ToLower(tagName.FindStringSubmatch(m)[1]) + "]"
+	})
+	return tagName.ReplaceAllStringFunc(s, func(m string) string {
+		return "untrusted-" + strings.ToLower(tagName.FindStringSubmatch(m)[1])
+	})
 }
 
 // Visible is what agents and reviewers read of issue text: invisible
