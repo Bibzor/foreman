@@ -274,10 +274,11 @@ func (e *Engine) apply(ctx context.Context, c *Case, t *Transition) error {
 	next := c.Issue
 	next.State = t.To
 	next.StateEnteredAt = e.Now().UTC()
+	next.PrepFailures = 0
 	if t.Update != nil {
 		t.Update(&next)
 	}
-	err := e.Store.Transition(ctx, c.Issue.State, next, t.Reason, store.Effect{
+	next, err := e.Store.Transition(ctx, c.Issue.State, next, t.Reason, store.Effect{
 		Comment:      t.Comment,
 		RemoveLabels: t.RemoveLabels,
 		Close:        t.Close,
@@ -422,9 +423,10 @@ func (c *Case) Snapshot(ctx context.Context) (qualify.Snapshot, error) {
 
 // Authorized reports whether label is on the issue and its latest
 // "labeled" event is by an authorized user. For go and no-go the event
-// must also be newer than the current state, so a stale approval cannot
-// carry over. A label added by anyone else is ignored, and the bot says
-// so once per labeling event.
+// must also be newer than the comment announcing the current state, so a
+// stale approval cannot carry over; both times come from GitHub's clock.
+// A label added by anyone else is ignored, and the bot says so once per
+// labeling event.
 func (c *Case) Authorized(ctx context.Context, label string) (bool, error) {
 	if !c.Live.HasLabel(label) {
 		return false, nil
@@ -454,9 +456,28 @@ func (c *Case) Authorized(ctx context.Context, label string) (bool, error) {
 		}
 		return false, c.e.flush(ctx, c.Repo)
 	}
-	// GitHub timestamps have second precision.
-	if label != LabelTrigger && last.CreatedAt.Before(c.Issue.StateEnteredAt.Truncate(time.Second)) {
-		return false, nil
+	if label == LabelTrigger {
+		return true, nil
 	}
-	return true, nil
+	since, ok, err := c.stateCommentTime(ctx)
+	if err != nil || !ok {
+		return false, err
+	}
+	return !last.CreatedAt.Before(since), nil
+}
+
+// stateCommentTime returns when GitHub recorded the bot comment announcing
+// the current state. ok is false while that comment is not posted.
+func (c *Case) stateCommentTime(ctx context.Context) (time.Time, bool, error) {
+	cs, err := c.Comments(ctx)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	mark := marker(c.Issue.StateOutboxID)
+	for _, cm := range cs {
+		if c.e.isBot(cm.Author) && strings.Contains(cm.Body, mark) {
+			return cm.CreatedAt, true, nil
+		}
+	}
+	return time.Time{}, false, nil
 }
