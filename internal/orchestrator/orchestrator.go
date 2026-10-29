@@ -17,17 +17,19 @@ import (
 	"time"
 
 	"github.com/Bibzor/foreman/internal/config"
+	"github.com/Bibzor/foreman/internal/develop"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/qualify"
 	"github.com/Bibzor/foreman/internal/store"
 	"github.com/Bibzor/foreman/internal/workspace"
 )
 
-// Trigger and decision labels.
+// Trigger and decision labels, and the label of a risky pull request.
 const (
-	LabelTrigger = "foreman"
-	LabelGo      = "go"
-	LabelNoGo    = "no-go"
+	LabelTrigger  = "foreman"
+	LabelGo       = "go"
+	LabelNoGo     = "no-go"
+	LabelHighRisk = "foreman:high-risk"
 )
 
 // GitHub is what the engine needs from GitHub.
@@ -42,11 +44,22 @@ type GitHub interface {
 	RemoveLabel(ctx context.Context, repo config.Repo, number int, label string) error
 	CreateComment(ctx context.Context, repo config.Repo, number int, body string) (int64, error)
 	CloseIssue(ctx context.Context, repo config.Repo, number int) error
+
+	CreatePullRequest(ctx context.Context, repo config.Repo, head, base, title, body string) (int, error)
+	PullRequestsByHead(ctx context.Context, repo config.Repo, branch string) ([]github.PullRequest, error)
+	PullRequest(ctx context.Context, repo config.Repo, number int) (github.PullRequest, error)
+	Reviews(ctx context.Context, repo config.Repo, number int) ([]github.Review, error)
+	ReviewComments(ctx context.Context, repo config.Repo, number int, reviewID int64) ([]github.ReviewComment, error)
 }
 
-// Workspace prepares the directories an agent works in.
+// Workspace prepares the directories an agent works in, and publishes
+// its work.
 type Workspace interface {
 	Prepare(ctx context.Context, repo config.Repo, number int) (workspace.Dirs, error)
+	PrepareDev(ctx context.Context, repo config.Repo, number int, branch string) (workspace.Dirs, error)
+	PrepareBranch(ctx context.Context, repo config.Repo, number int, branch string, depth int, need string) (workspace.Dirs, error)
+	Snapshot(ctx context.Context, repo config.Repo, number int, workdir, branch string) (dir, tip string, err error)
+	Push(ctx context.Context, repo config.Repo, dir, sha, branch string, force bool) error
 }
 
 // Handler handles a tracked issue in one state. It returns the transition
@@ -61,12 +74,16 @@ type HandlerFunc func(ctx context.Context, c *Case) (*Transition, error)
 // Handle calls f.
 func (f HandlerFunc) Handle(ctx context.Context, c *Case) (*Transition, error) { return f(ctx, c) }
 
-// Transition is a state change and the comment that announces it.
+// Transition is a state change and the comment that announces it. A
+// transition to the same state records a step within it.
 type Transition struct {
 	To           store.State
 	Reason       string // stored in the history
-	Comment      string // posted on the issue
-	RemoveLabels []string
+	Comment      string // posted on the issue, or on PR when set
+	PR           int
+	OpenPR       *store.PullRequest // opened before the comment is posted
+	RemoveLabels []string           // from the issue
+	AddLabels    []string           // to PR
 	Close        bool
 	Update       func(*store.Issue) // other fields of the new row
 }
@@ -78,6 +95,7 @@ type Deps struct {
 	Store     *store.Store
 	Workspace Workspace
 	Agent     qualify.Agent
+	Developer develop.Agent
 	Log       *slog.Logger
 	Now       func() time.Time
 }
@@ -89,7 +107,8 @@ type Engine struct {
 	bot      string
 }
 
-// New returns an engine with the qualification handlers registered.
+// New returns an engine with the qualification and development handlers
+// registered.
 func New(d Deps) *Engine {
 	if d.Log == nil {
 		d.Log = slog.New(slog.DiscardHandler)
@@ -97,11 +116,17 @@ func New(d Deps) *Engine {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	if d.Config.WIPLimit <= 0 {
+		d.Config.WIPLimit = config.DefaultWIPLimit
+	}
 	e := &Engine{Deps: d, handlers: make(map[store.State]Handler)}
 	e.Register(store.Qualifying, HandlerFunc(e.qualifying))
 	e.Register(store.NeedsInfo, HandlerFunc(e.needsInfo))
 	e.Register(store.AwaitingGo, HandlerFunc(e.awaitingGo))
 	e.Register(store.Suspect, HandlerFunc(e.suspect))
+	e.Register(store.Queued, HandlerFunc(e.queued))
+	e.Register(store.InProgress, HandlerFunc(e.inProgress))
+	e.Register(store.InReview, HandlerFunc(e.inReview))
 	return e
 }
 
@@ -116,6 +141,10 @@ func Labels() []github.Label {
 		{Name: store.NeedsInfo.Label(), Color: "fbca04", Description: "foreman: waiting for answers"},
 		{Name: store.AwaitingGo.Label(), Color: "0e8a16", Description: "foreman: waiting for go / no-go"},
 		{Name: store.Queued.Label(), Color: "1d76db", Description: "foreman: approved, queued"},
+		{Name: store.InProgress.Label(), Color: "fef2c0", Description: "foreman: the agent is developing"},
+		{Name: store.InReview.Label(), Color: "bfd4f2", Description: "foreman: pull request in review"},
+		{Name: store.Merged.Label(), Color: "6f42c1", Description: "foreman: pull request merged"},
+		{Name: LabelHighRisk, Color: "b60205", Description: "foreman: this pull request needs a careful review"},
 		{Name: store.Blocked.Label(), Color: "b60205", Description: "foreman: blocked, needs a human"},
 		{Name: store.Suspect.Label(), Color: "d93f0b", Description: "foreman: suspicious, needs a human"},
 		{Name: LabelGo, Color: "0e8a16", Description: "Approve (authorized users only)"},
@@ -230,8 +259,9 @@ func (e *Engine) optIns(ctx context.Context, repo config.Repo) error {
 }
 
 // maxSteps bounds the transitions of one issue in one cycle, so that, for
-// example, an answered question is qualified without waiting a cycle.
-const maxSteps = 3
+// example, an answered question is qualified without waiting a cycle, or
+// a queued issue is developed, opened as a PR and pre-reviewed.
+const maxSteps = 4
 
 // process runs one tracked issue through its state handlers.
 func (e *Engine) process(ctx context.Context, repo config.Repo, is store.Issue) error {
@@ -279,8 +309,11 @@ func (e *Engine) apply(ctx context.Context, c *Case, t *Transition) error {
 		t.Update(&next)
 	}
 	next, err := e.Store.Transition(ctx, c.Issue.State, next, t.Reason, store.Effect{
+		OpenPR:       t.OpenPR,
 		Comment:      t.Comment,
+		PR:           t.PR,
 		RemoveLabels: t.RemoveLabels,
+		AddLabels:    t.AddLabels,
 		Close:        t.Close,
 	})
 	if err != nil {
@@ -288,7 +321,16 @@ func (e *Engine) apply(ctx context.Context, c *Case, t *Transition) error {
 	}
 	e.Log.Info("transition", "repo", c.Repo.String(), "issue", next.Number, "from", string(c.Issue.State), "to", string(t.To), "reason", t.Reason)
 	c.Issue = next
-	return e.flush(ctx, c.Repo)
+	if err := e.flush(ctx, c.Repo); err != nil {
+		return err
+	}
+	// The side effects may record more, such as the number of the PR.
+	is, _, err := e.Store.Get(ctx, c.Repo.String(), next.Number)
+	if err != nil {
+		return err
+	}
+	c.Issue = is
+	return nil
 }
 
 // marker tags each bot comment with its outbox entry, so a comment posted
@@ -314,6 +356,11 @@ func (e *Engine) flush(ctx context.Context, repo config.Repo) error {
 }
 
 func (e *Engine) effect(ctx context.Context, repo config.Repo, o store.Outbox) error {
+	if o.OpenPR != nil {
+		if err := e.openPR(ctx, repo, o); err != nil {
+			return err
+		}
+	}
 	if o.Comment != "" && !o.CommentPosted {
 		if err := e.postOnce(ctx, repo, o); err != nil {
 			return err
@@ -332,6 +379,11 @@ func (e *Engine) effect(ctx context.Context, repo config.Repo, o store.Outbox) e
 			return err
 		}
 	}
+	for _, l := range o.AddLabels {
+		if err := e.GitHub.AddLabel(ctx, repo, o.PR, l); err != nil {
+			return err
+		}
+	}
 	if o.Close {
 		if err := e.GitHub.CloseIssue(ctx, repo, o.Number); err != nil {
 			return err
@@ -341,8 +393,12 @@ func (e *Engine) effect(ctx context.Context, repo config.Repo, o store.Outbox) e
 }
 
 func (e *Engine) postOnce(ctx context.Context, repo config.Repo, o store.Outbox) error {
+	target := o.Number
+	if o.PR != 0 {
+		target = o.PR
+	}
 	mark := marker(o.ID)
-	comments, err := e.GitHub.Comments(ctx, repo, o.Number)
+	comments, err := e.GitHub.Comments(ctx, repo, target)
 	if err != nil {
 		return err
 	}
@@ -351,8 +407,33 @@ func (e *Engine) postOnce(ctx context.Context, repo config.Repo, o store.Outbox)
 			return nil
 		}
 	}
-	_, err = e.GitHub.CreateComment(ctx, repo, o.Number, o.Comment+"\n\n"+mark)
+	_, err = e.GitHub.CreateComment(ctx, repo, target, o.Comment+"\n\n"+mark)
 	return err
+}
+
+// openPR opens the pull request of an outbox entry and records its
+// number. The body carries the entry's marker, so a PR opened just before
+// a crash is found and adopted instead of opened twice.
+func (e *Engine) openPR(ctx context.Context, repo config.Repo, o store.Outbox) error {
+	mark := marker(o.ID)
+	prs, err := e.GitHub.PullRequestsByHead(ctx, repo, o.OpenPR.Head)
+	if err != nil {
+		return err
+	}
+	number := 0
+	for _, pr := range prs {
+		if strings.Contains(pr.Body, mark) {
+			number = pr.Number
+			break
+		}
+	}
+	if number == 0 {
+		p := o.OpenPR
+		if number, err = e.GitHub.CreatePullRequest(ctx, repo, p.Head, p.Base, p.Title, p.Body+"\n\n"+mark); err != nil {
+			return err
+		}
+	}
+	return e.Store.SetPR(ctx, repo.String(), o.Number, number)
 }
 
 // syncLabel makes the foreman:* labels of the issue exactly the label of s.
