@@ -19,6 +19,8 @@ import (
 // a human must take over.
 const MaxNeedsInfoRounds = 3
 
+const reasonNeedsInfoLimit = "needs_info_limit"
+
 // qualifying runs the agent on a fresh workspace and routes its result.
 func (e *Engine) qualifying(ctx context.Context, c *Case) (*Transition, error) {
 	snap, err := c.Snapshot(ctx)
@@ -106,7 +108,7 @@ func route(is store.Issue, res qualify.Result, snap qualify.Snapshot, intro stri
 		if is.NeedsInfoRounds >= MaxNeedsInfoRounds {
 			return &Transition{
 				To:     store.Blocked,
-				Reason: "needs_info_limit",
+				Reason: reasonNeedsInfoLimit,
 				Comment: intro + fmt.Sprintf("**Blocked: still unclear after %d rounds of questions.** "+
 					"A human needs to take over.", MaxNeedsInfoRounds),
 			}

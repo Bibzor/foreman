@@ -21,6 +21,8 @@ import (
 // authorized user requested changes, before a human must take over.
 const MaxRevisions = 2
 
+const reasonRevisionLimit = "revision limit"
+
 // Limits that keep comments and PR bodies under GitHub's 65536 characters.
 const (
 	maxSection = 25000
@@ -390,7 +392,7 @@ func (e *Engine) review(ctx context.Context, c *Case, pr github.PullRequest) (*T
 	if c.Issue.RevisionRounds >= MaxRevisions {
 		return &Transition{
 			To:     store.Blocked,
-			Reason: "revision limit",
+			Reason: reasonRevisionLimit,
 			Comment: fmt.Sprintf("**Blocked: changes were requested again after %d revisions** (review by @%s on #%d). "+
 				"A human needs to take over.", MaxRevisions, rv.Author, pr.Number),
 			Update: func(is *store.Issue) { is.LastReviewID = rv.ID },
