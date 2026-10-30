@@ -39,6 +39,7 @@ type fixture struct {
 	bare      string
 	// skew is added to foreman's clock only, not to GitHub's.
 	skew time.Duration
+	wip  int // wip_limit; 0 is the default
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -82,7 +83,7 @@ func (fx *fixture) restart() {
 	fx.engine = orchestrator.New(orchestrator.Deps{
 		Config: config.Config{
 			Repos: []config.Repo{repo}, AuthorizedUsers: []string{owner},
-			PollInterval: time.Second, DataDir: fx.dir,
+			PollInterval: time.Second, DataDir: fx.dir, WIPLimit: fx.wip,
 		},
 		GitHub:    fx.gh,
 		Store:     db,
