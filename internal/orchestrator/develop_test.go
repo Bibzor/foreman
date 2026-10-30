@@ -486,6 +486,39 @@ func TestPreReviewHighRisk(t *testing.T) {
 	}
 }
 
+// The pre-review runs an agent with the skills pack: it checks
+// skills_version at the tip of the default branch, like development.
+func TestPreReviewChecksSkillsVersion(t *testing.T) {
+	fx := newDevFixture(t)
+	work := goodWork(t)
+	fx.agent.pushDev(devAnswer{res: done(), work: func(dir string) {
+		// main moves on while the agent works: development read a valid
+		// file, the pre-review reads this one.
+		fx.pushConfig(fmt.Sprintf(defaultProject, "9.9.9", "true", "true"))
+		work(dir)
+	}})
+	fx.approve()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q: %s", s, fx.lastComment())
+	}
+	last := fx.lastComment()
+	if !strings.Contains(last, "is missing or invalid") || !strings.Contains(last, "project pins 9.9.9, foreman ships "+skills.PackVersion) {
+		t.Fatalf("comment = %q", last)
+	}
+	if len(fx.agent.preReqs) != 0 {
+		t.Fatal("the pre-review agent ran with a mismatched skills pack")
+	}
+
+	// Fixed on main, a retry runs the pre-review.
+	fx.pushConfig(fmt.Sprintf(defaultProject, skills.PackVersion, "true", "true"))
+	fx.agent.pushPre(lowFindings())
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s, is := fx.state(), fx.issueRow(); s != store.InReview || !is.PrereviewDone || len(fx.agent.preReqs) != 1 {
+		t.Fatalf("after retry: state = %q, prereview done = %v, pre-reviews = %d", s, is.PrereviewDone, len(fx.agent.preReqs))
+	}
+}
+
 func TestPreReviewDependencyFile(t *testing.T) {
 	// go.mod is a dependency file; here it is not protected.
 	p := strings.Replace(fmt.Sprintf(defaultProject, skills.PackVersion, "true", "true"), ", go.mod]", "]", 1)
