@@ -81,10 +81,22 @@ func approved(is store.Issue) (qualify.Snapshot, qualify.Result, error) {
 	return snap, q, nil
 }
 
-// projectConfig parses .foreman.yml; a missing or invalid file blocks the
-// issue.
+// projectConfig parses .foreman.yml for a step that runs an agent, so
+// skills_version must be the pack foreman ships; a missing or invalid
+// file blocks the issue.
 func projectConfig(dirs workspace.Dirs) (project.Config, *Transition) {
 	p, err := project.Parse(dirs.ProjectFile, skills.PackVersion)
+	return configOrBlock(dirs, p, err)
+}
+
+// deployConfig parses .foreman.yml for a step that runs no agent:
+// skills_version may pin any version.
+func deployConfig(dirs workspace.Dirs) (project.Config, *Transition) {
+	p, err := project.ParseNoPack(dirs.ProjectFile)
+	return configOrBlock(dirs, p, err)
+}
+
+func configOrBlock(dirs workspace.Dirs, p project.Config, err error) (project.Config, *Transition) {
 	if err == nil {
 		return p, nil
 	}

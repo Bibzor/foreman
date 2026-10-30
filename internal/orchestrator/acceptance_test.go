@@ -283,6 +283,69 @@ func TestAcceptanceFailures(t *testing.T) {
 	})
 }
 
+// pushConfig commits a new .foreman.yml on main, as a maintainer would
+// after the merge, and returns the commit.
+func (fx *fixture) pushConfig(content string) string {
+	fx.t.Helper()
+	src := fx.t.TempDir()
+	gitRun(fx.t, src, "clone", "-q", fx.bare, ".")
+	writeFiles(fx.t, src, map[string]string{".foreman.yml": content})
+	gitRun(fx.t, src, "commit", "-q", "-am", "chore: update .foreman.yml")
+	gitRun(fx.t, src, "push", "-q", "origin", "HEAD:main")
+	return gitRun(fx.t, src, "rev-parse", "HEAD")
+}
+
+// The merge commit predates a configuration update: deploying builds
+// the merge commit with the configuration of the default branch's tip.
+func TestAcceptanceUsesTheConfigOfTheDefaultBranchTip(t *testing.T) {
+	fx, pr := inReview(t) // developed with no acceptance section
+	_, merge := fx.approveAndMerge(pr, "foreman/7")
+	config := fx.pushConfig(fmt.Sprintf(defaultProject, "9.9.9", "true", "true") +
+		strings.Replace(acceptanceSection, "host_port: 18080", "host_port: 18090", 1))
+	fx.tick()
+	if s := fx.state(); s != store.InAcceptance {
+		t.Fatalf("state = %q: %s", s, fx.lastComment())
+	}
+	build, run := fx.docker.calledWith("build"), fx.docker.calledWith("run")
+	if len(build) != 1 || len(run) != 1 {
+		t.Fatalf("docker calls = %q", fx.docker.subcommands())
+	}
+	if !slices.Contains(build[0], "foreman.sha="+merge) || !containsSeq(run[0], []string{"-p", "127.0.0.1:18090:8080"}) {
+		t.Fatalf("build = %q\nrun = %q", build[0], run[0])
+	}
+	// The code is the merge commit's, not the tip's.
+	dir := build[0][len(build[0])-1]
+	if head := gitRun(t, dir, "rev-parse", "HEAD"); head != merge {
+		t.Fatalf("built %s, want the merge commit %s", head, merge)
+	}
+	last := fx.lastComment()
+	for _, want := range []string{"http://localhost:18090", "- Deployed sha: `" + merge + "`",
+		"- Configuration: `.foreman.yml` at `" + config + "`, the tip of `main`"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("comment lacks %q:\n%s", want, last)
+		}
+	}
+}
+
+// skills_version matters only to the steps that run an agent.
+func TestSkillsVersionMismatchDoesNotBlockDeploying(t *testing.T) {
+	fx, pr := inReviewWith(t, withAcceptance)
+	fx.approveAndMerge(pr, "foreman/7")
+	fx.pushConfig(fmt.Sprintf(defaultProject, "0.0.1", "true", "true") + acceptanceSection)
+	fx.tick()
+	if s := fx.state(); s != store.InAcceptance {
+		t.Fatalf("state = %q: %s", s, fx.lastComment())
+	}
+	for _, c := range fx.gh.botComments() {
+		if strings.Contains(c, "project pins") {
+			t.Fatalf("blocked on skills_version: %q", c)
+		}
+	}
+	if len(fx.docker.calledWith("run")) != 1 {
+		t.Fatalf("docker calls = %q", fx.docker.subcommands())
+	}
+}
+
 func TestNoAcceptanceSection(t *testing.T) {
 	fx, pr := inReview(t)
 	fx.approveAndMerge(pr, "foreman/7")
