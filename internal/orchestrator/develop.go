@@ -322,8 +322,13 @@ func (e *Engine) preReview(ctx context.Context, c *Case, pr github.PullRequest) 
 	if err != nil {
 		return nil, err
 	}
+	commits, err := develop.Commits(ctx, dirs.Workdir, c.Issue.BaseSHA, "HEAD")
+	if err != nil {
+		return nil, err
+	}
 	req := develop.PreReviewRequest{
 		Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Issue: snap, AcceptanceCriteria: q.AcceptanceCriteria, Diff: diff,
+		PRBody: pr.Body, Commits: commits,
 	}
 	res, err := e.Developer.PreReview(ctx, req)
 	var inv *qualify.InvalidOutputError
