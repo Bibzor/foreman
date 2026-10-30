@@ -318,14 +318,16 @@ func TestPullRequests(t *testing.T) {
 		if q := r.URL.Query(); q.Get("head") != "Bibzor:foreman/7" || q.Get("state") != "all" {
 			t.Errorf("query = %s", r.URL.RawQuery)
 		}
-		_, _ = w.Write([]byte(`[{"number": 12, "state": "closed", "merged_at": "2026-10-28T10:00:00Z", "body": "x", "head": {"ref": "foreman/7"}}]`))
+		_, _ = w.Write([]byte(`[{"number": 12, "state": "closed", "merged_at": "2026-10-28T10:00:00Z", "body": "x",
+			"head": {"ref": "foreman/7", "sha": "aaa"}, "merge_commit_sha": "mmm"}]`))
 	})
 	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls/12", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"number": 12, "state": "open", "merged": false, "body": null, "commits": 3, "head": {"ref": "foreman/7"}}`))
 	})
 	f.mux.HandleFunc("GET /repos/Bibzor/demo-api/pulls/12/reviews", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[
-			{"id": 1, "user": {"login": "Bibzor"}, "state": "CHANGES_REQUESTED", "body": "fix it", "submitted_at": "2026-10-28T10:00:00Z"},
+			{"id": 1, "user": {"login": "Bibzor"}, "state": "CHANGES_REQUESTED", "body": "fix it", "submitted_at": "2026-10-28T10:00:00Z",
+			 "commit_id": "abc"},
 			{"id": 2, "user": null, "state": "APPROVED"}
 		]`))
 	})
@@ -339,7 +341,8 @@ func TestPullRequests(t *testing.T) {
 		t.Fatalf("CreatePullRequest = %d %v", n, err)
 	}
 	prs, err := c.PullRequestsByHead(ctx, repo, "foreman/7")
-	if err != nil || len(prs) != 1 || prs[0].Open || !prs[0].Merged || prs[0].Head != "foreman/7" {
+	if err != nil || len(prs) != 1 || prs[0].Open || !prs[0].Merged || prs[0].Head != "foreman/7" ||
+		prs[0].HeadSHA != "aaa" || prs[0].MergeCommitSHA != "mmm" {
 		t.Fatalf("PullRequestsByHead = %+v %v", prs, err)
 	}
 	pr, err := c.PullRequest(ctx, repo, 12)
@@ -347,7 +350,7 @@ func TestPullRequests(t *testing.T) {
 		t.Fatalf("PullRequest = %+v %v", pr, err)
 	}
 	reviews, err := c.Reviews(ctx, repo, 12)
-	if err != nil || len(reviews) != 1 || reviews[0].State != "CHANGES_REQUESTED" || reviews[0].Author != "Bibzor" {
+	if err != nil || len(reviews) != 1 || reviews[0].State != "CHANGES_REQUESTED" || reviews[0].Author != "Bibzor" || reviews[0].CommitID != "abc" {
 		t.Fatalf("Reviews = %+v %v", reviews, err)
 	}
 	comments, err := c.ReviewComments(ctx, repo, 12, 1)

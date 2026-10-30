@@ -228,6 +228,40 @@ func TestPrepareReadsProjectFile(t *testing.T) {
 	}
 }
 
+func TestPrepareAt(t *testing.T) {
+	bare := upstream(t)
+	src := t.TempDir()
+	run(t, src, "clone", "-q", bare, ".")
+	commit(t, src, "merge", map[string]string{".foreman.yml": "at the merge\n", "app.go": "package app\n"})
+	merge := run(t, src, "rev-parse", "HEAD")
+	// The default branch moves on after the merge.
+	commit(t, src, "later", map[string]string{".foreman.yml": "later\n", "app.go": "package app // later\n"})
+	run(t, src, "push", "-q", "origin", "HEAD:trunk")
+
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareAt(context.Background(), repoID, 7, merge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, d.Workdir, "rev-parse", "HEAD"); got != merge || d.Base != merge {
+		t.Fatalf("HEAD = %s, Base = %s, want the merge commit %s", got, d.Base, merge)
+	}
+	if string(d.ProjectFile) != "at the merge\n" || d.BaseBranch != "trunk" {
+		t.Fatalf("dirs = %+v, want .foreman.yml of the merge commit", d)
+	}
+	if b, _ := os.ReadFile(filepath.Join(d.Workdir, "app.go")); string(b) != "package app\n" {
+		t.Fatalf("app.go = %q", b)
+	}
+	if err := scanForSecrets(d.Workdir, []string{testToken}); err != nil {
+		t.Fatal(err)
+	}
+	// The tip itself needs no fetch.
+	tip := run(t, src, "rev-parse", "HEAD")
+	if d, err := w.PrepareAt(context.Background(), repoID, 7, tip); err != nil || d.Base != tip || string(d.ProjectFile) != "later\n" {
+		t.Fatalf("at the tip: %+v %v", d, err)
+	}
+}
+
 // pushBranch makes foreman/7 on the upstream: two commits over trunk.
 func pushBranch(t *testing.T, bare string) (base, tip string) {
 	t.Helper()

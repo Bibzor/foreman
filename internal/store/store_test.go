@@ -127,9 +127,16 @@ func TestClosedNotTracked(t *testing.T) {
 	if _, err := s.Transition(ctx, store.None, is, "x", store.Effect{}); err != nil {
 		t.Fatal(err)
 	}
+	done := store.Issue{Repo: repo, Number: 2, State: store.Done, Author: "a", StateEnteredAt: t0}
+	if _, err := s.Transition(ctx, store.None, done, "x", store.Effect{}); err != nil {
+		t.Fatal(err)
+	}
 	tracked, _ := s.Tracked(ctx, repo)
 	if len(tracked) != 0 {
-		t.Fatalf("tracked = %+v", tracked)
+		t.Fatalf("tracked = %+v: closed and done issues are not tracked", tracked)
+	}
+	if store.Done.Label() != "foreman:done" {
+		t.Fatal("a done issue keeps its foreman:done label")
 	}
 	if store.Closed.Label() != "" || store.AwaitingGo.Label() != "foreman:awaiting-go" {
 		t.Fatal("Label is wrong")
@@ -169,7 +176,8 @@ func TestDevelopmentFields(t *testing.T) {
 	ctx := context.Background()
 	s := open(t, filepath.Join(t.TempDir(), "foreman.db"))
 	is := store.Issue{Repo: repo, Number: 7, State: store.InReview, Author: "alice", StateEnteredAt: t0,
-		BaseBranch: "main", BaseSHA: "b", DevSHA: "d", HeadSHA: "h", RevisionRounds: 1, LastReviewID: 42, PrereviewDone: true}
+		BaseBranch: "main", BaseSHA: "b", DevSHA: "d", HeadSHA: "h", RevisionRounds: 1, LastReviewID: 42, PrereviewDone: true,
+		MergeSHA: "m", AcceptanceRounds: 1, AcceptanceFeedback: "the button is blue", AcceptanceFeedbackAuthor: "Bibzor"}
 	pr := &store.PullRequest{Head: "foreman/7", Base: "main", Title: "t", Body: "Refs #7"}
 	stored, err := s.Transition(ctx, store.None, is, "x", store.Effect{OpenPR: pr, Comment: "c", PR: 9, AddLabels: []string{"foreman:high-risk"}})
 	if err != nil {

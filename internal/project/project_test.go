@@ -97,6 +97,75 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+const acceptance = `acceptance:
+  dockerfile: deploy/Dockerfile
+  build_args: {VITE_API_URL: "http://localhost:18080"}
+  container_port: 8080
+  host_port: 18080
+  env: {ALLOWED_ORIGINS: "http://localhost:18081", _X1: ""}
+  smoke:
+    - {path: /healthz, status: 200}
+    - {path: "/api/v1/items?limit=1", status: 401}
+`
+
+func TestParseAcceptance(t *testing.T) {
+	c, err := project.Parse([]byte(valid), pack)
+	if err != nil || c.Acceptance != nil {
+		t.Fatalf("no section: %+v %v", c.Acceptance, err)
+	}
+	c, err = project.Parse([]byte(valid+acceptance), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := c.Acceptance
+	if a == nil || a.Dockerfile != "deploy/Dockerfile" || a.ContainerPort != 8080 || a.HostPort != 18080 ||
+		a.BuildArgs["VITE_API_URL"] != "http://localhost:18080" || a.Env["ALLOWED_ORIGINS"] != "http://localhost:18081" ||
+		!slices.Equal(a.Smoke, []project.Smoke{{Path: "/healthz", Status: 200}, {Path: "/api/v1/items?limit=1", Status: 401}}) {
+		t.Fatalf("acceptance = %+v", a)
+	}
+	c, err = project.Parse([]byte(valid+"acceptance: {container_port: 80, host_port: 18080, smoke: [{path: /, status: 200}]}\n"), pack)
+	if err != nil || c.Acceptance.Dockerfile != "Dockerfile" || c.Acceptance.Env != nil {
+		t.Fatalf("defaults: %+v %v", c.Acceptance, err)
+	}
+}
+
+func TestParseAcceptanceErrors(t *testing.T) {
+	tests := []struct {
+		name, old, new, want string
+	}{
+		{"unknown key", "  host_port: 18080\n", "  host_port: 18080\n  command: make deploy\n", "field command not found"},
+		{"absolute dockerfile", "deploy/Dockerfile", "/etc/Dockerfile", "acceptance.dockerfile"},
+		{"dotdot dockerfile", "deploy/Dockerfile", "../Dockerfile", "acceptance.dockerfile"},
+		{"unclean dockerfile", "deploy/Dockerfile", "deploy/../Dockerfile", "acceptance.dockerfile"},
+		{"lower-case env", "ALLOWED_ORIGINS:", "allowed_origins:", "acceptance.env: name \"allowed_origins\""},
+		{"env name with a dash", "ALLOWED_ORIGINS:", "ALLOWED-ORIGINS:", "acceptance.env: name"},
+		{"env name with a digit first", "ALLOWED_ORIGINS:", "1ALLOWED:", "acceptance.env: name"},
+		{"multi-line env", `"http://localhost:18081"`, `"a\nb"`, "the value of ALLOWED_ORIGINS must be on one line"},
+		{"build arg name", "VITE_API_URL:", "vite url:", "acceptance.build_args: name"},
+		{"build arg newline", `"http://localhost:18080"`, `"x\r--privileged"`, "the value of VITE_API_URL must be on one line"},
+		{"no container port", "  container_port: 8080\n", "", "container_port must be between 1 and 65535"},
+		{"container port too big", "container_port: 8080", "container_port: 70000", "container_port"},
+		{"privileged host port", "host_port: 18080", "host_port: 80", "host_port must be between 1024 and 65535"},
+		{"host port as string", "host_port: 18080", "host_port: \"127.0.0.1:18080\"", "cannot unmarshal"},
+		{"no smoke", "    - {path: /healthz, status: 200}\n    - {path: \"/api/v1/items?limit=1\", status: 401}\n", "", "acceptance.smoke needs 1 to 10 checks"},
+		{"relative smoke path", "path: /healthz", "path: healthz", "acceptance.smoke[0].path"},
+		{"smoke path with a space", "path: /healthz", "path: \"/health z\"", "acceptance.smoke[0].path"},
+		{"smoke status", "status: 200", "status: 2000", "acceptance.smoke[0].status"},
+		{"smoke unknown key", "status: 200}", "status: 200, method: POST}", "field method not found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.Contains(acceptance, tt.old) {
+				t.Fatalf("fixture does not contain %q", tt.old)
+			}
+			_, err := project.Parse([]byte(valid+strings.Replace(acceptance, tt.old, tt.new, 1)), pack)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseMissing(t *testing.T) {
 	if _, err := project.Parse(nil, pack); !errors.Is(err, project.ErrMissing) {
 		t.Fatalf("err = %v", err)
