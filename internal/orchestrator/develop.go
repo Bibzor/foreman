@@ -326,7 +326,9 @@ func (e *Engine) branchWorkspace(ctx context.Context, c *Case, pr github.PullReq
 
 // preReview runs a separate, read-only agent on the PR diff and posts
 // its findings on the PR. A high finding, a dependency or auth change, or
-// a pre-review that could not run labels the PR high-risk.
+// a pre-review that could not run labels the PR high-risk. Like every
+// agent step, it needs a valid .foreman.yml at the tip of the default
+// branch that pins the skills pack foreman ships.
 func (e *Engine) preReview(ctx context.Context, c *Case, pr github.PullRequest) (*Transition, error) {
 	snap, q, err := approved(c.Issue)
 	if err != nil {
@@ -335,6 +337,9 @@ func (e *Engine) preReview(ctx context.Context, c *Case, pr github.PullRequest) 
 	dirs, t, err := e.branchWorkspace(ctx, c, pr)
 	if t != nil || err != nil {
 		return t, err
+	}
+	if _, t := projectConfig(dirs); t != nil {
+		return t, nil
 	}
 	diff, err := workspace.Git(ctx, dirs.Workdir, "diff", "--no-renames", c.Issue.BaseSHA, "HEAD")
 	if err != nil {
