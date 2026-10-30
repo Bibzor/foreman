@@ -721,7 +721,7 @@ func TestRetryDevelopment(t *testing.T) {
 	}
 	var retried bool
 	for _, c := range fx.gh.botComments() {
-		retried = retried || strings.Contains(c, "**Retrying.** An authorized user added `retry`: foreman goes back to `in-progress`")
+		retried = retried || strings.Contains(c, "**Retrying.** An authorized user added `retry`: foreman goes back to `queued`")
 	}
 	if !retried || fx.agent.devCalls() != 2 {
 		t.Fatalf("retried = %v, dev calls = %d", retried, fx.agent.devCalls())
@@ -779,4 +779,107 @@ func TestRetryIgnored(t *testing.T) {
 			t.Fatalf("a stale retry was applied: state = %q, agent calls = %d", s, fx.agent.calls())
 		}
 	})
+}
+
+func TestRetryResetsTheNeedsInfoCounter(t *testing.T) {
+	fx := newFixture(t)
+	fx.agent.push(needsInfo(), needsInfo(), needsInfo(), needsInfo())
+	fx.gh.label("foreman", owner)
+	fx.tick()
+	for range orchestrator.MaxNeedsInfoRounds {
+		fx.gh.comment(author, "more details")
+		fx.tick()
+	}
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	fx.agent.push(needsInfo())
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s, is := fx.state(), fx.issueRow(); s != store.NeedsInfo || is.NeedsInfoRounds != 1 {
+		t.Fatalf("state = %q, needs-info rounds = %d: the counter was not reset", s, is.NeedsInfoRounds)
+	}
+	var reset bool
+	for _, c := range fx.gh.botComments() {
+		reset = reset || strings.Contains(c, "The `needs_info_rounds` counter was reset.")
+	}
+	if !reset {
+		t.Fatal("the retry comment does not name the counter it reset")
+	}
+}
+
+func TestRetryDevelopmentWaitsForTheWIPLimit(t *testing.T) {
+	fx := newDevFixture(t)
+	fx.wip = 1
+	fx.restart()
+	fx.agent.pushDev(devAnswer{work: commits(t, testCommit), res: develop.Result{Status: develop.Failed, FailureReport: "stuck"}})
+	fx.approve()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	// Another issue takes the only slot.
+	fx.gh.open(repo, 8, author, "Issue 8", "Please add GET /health.")
+	fx.agent.push(ready())
+	fx.gh.labelOn(8, "foreman", owner)
+	fx.tick()
+	fx.agent.pushDev(devAnswer{work: goodWork(t), res: done()})
+	fx.agent.pushPre(lowFindings())
+	fx.gh.labelOn(8, "go", owner)
+	fx.tick()
+	if is, _, _ := fx.db.Get(context.Background(), repo.String(), 8); is.State != store.InReview {
+		t.Fatalf("issue 8 = %q", is.State)
+	}
+
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s := fx.state(); s != store.Queued || fx.agent.devCalls() != 2 {
+		t.Fatalf("state = %q, dev calls = %d: a retry must not skip the WIP limit", s, fx.agent.devCalls())
+	}
+	if last := fx.lastComment(); !strings.Contains(last, "**Waiting.** 1 issues are already in development or in review") {
+		t.Fatalf("comment = %q", last)
+	}
+}
+
+func TestRetryResetsTheRevisionCounter(t *testing.T) {
+	fx, pr := inReview(t)
+	for round := 1; round <= orchestrator.MaxRevisions+1; round++ {
+		fx.gh.review(pr, owner, "CHANGES_REQUESTED", fmt.Sprintf("Round %d.", round))
+		if round <= orchestrator.MaxRevisions {
+			fx.agent.pushDev(devAnswer{
+				work: commits(t, change{fmt.Sprintf("fix: round %d", round), map[string]string{"version.go": fmt.Sprintf("package main\n// %d\n", round)}}),
+				res:  revised(fmt.Sprintf("Round %d done.", round)),
+			})
+		}
+		fx.tick()
+	}
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	fx.gh.label("retry", owner)
+	fx.tick()
+	if s, is := fx.state(), fx.issueRow(); s != store.InReview || is.RevisionRounds != 0 {
+		t.Fatalf("state = %q, revision rounds = %d", s, is.RevisionRounds)
+	}
+	var retry string
+	for _, c := range fx.gh.botComments() {
+		if strings.Contains(c, "**Retrying.**") {
+			retry = c
+		}
+	}
+	if !strings.Contains(retry, "goes back to `in-review`") || !strings.Contains(retry, "The `revision_rounds` counter was reset.") {
+		t.Fatalf("retry comment = %q", retry)
+	}
+	// The review that hit the limit is not answered again; a new one is.
+	if fx.agent.devCalls() != 1+orchestrator.MaxRevisions {
+		t.Fatalf("developed %d times", fx.agent.devCalls())
+	}
+	fx.gh.review(pr, owner, "CHANGES_REQUESTED", "One more.")
+	fx.agent.pushDev(devAnswer{
+		work: commits(t, change{"fix: one more", map[string]string{"version.go": "package main\n// more\n"}}),
+		res:  revised("One more done."),
+	})
+	fx.tick()
+	if s, is := fx.state(), fx.issueRow(); s != store.InReview || is.RevisionRounds != 1 {
+		t.Fatalf("after a new review: state = %q, revision rounds = %d", s, is.RevisionRounds)
+	}
 }

@@ -14,6 +14,10 @@ import (
 // at it.
 const MaxPrepFailures = 5
 
+// reasonPrepPrefix starts the reason of a block by too many failures in a
+// row, counted in prep_failures.
+const reasonPrepPrefix = "could not "
+
 // prepare runs fn, which prepares a workspace. A failure is returned, to
 // be retried on the next cycle, until MaxPrepFailures in a row: then the
 // issue is blocked with the last error. Errors are already redacted.
@@ -41,7 +45,7 @@ func (e *Engine) retried(ctx context.Context, c *Case, what string, fn func() er
 	e.Log.Error("step keeps failing", "repo", c.Repo.String(), "issue", c.Issue.Number, "step", what, "failures", n, "err", err)
 	return &Transition{
 		To:     store.Blocked,
-		Reason: fmt.Sprintf("could not %s %d times in a row: %v", what, n, err),
+		Reason: fmt.Sprintf(reasonPrepPrefix+"%s %d times in a row: %v", what, n, err),
 		Comment: fmt.Sprintf("**Blocked: foreman could not %s %d times in a row.** The last error:\n\n%s",
 			what, n, qualify.Fenced(err.Error(), 2000)),
 	}, nil
