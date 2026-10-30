@@ -84,7 +84,8 @@ var (
 func goodWork(t *testing.T) func(string) { return commits(t, testCommit, codeCommit) }
 
 func done() develop.Result {
-	return develop.Result{Status: develop.Done, Plan: "## Summary\nAdd GET /version.\n\n## AC1: version\n- Approach: a handler.",
+	return develop.Result{Status: develop.Done, Plan: "## Summary\nAdd GET /version.\n\n## Files to change\n- `version.go`\n\n" +
+		"## AC1: version\n- Approach: a handler.",
 		ReviewGuide: "## Review guide\n\n### Read first\n- `version.go`"}
 }
 
@@ -222,6 +223,17 @@ func TestDevelopmentOpensAPullRequest(t *testing.T) {
 	// The pre-review saw the diff and its report is on the PR.
 	if pre := fx.agent.preReqs; len(pre) != 1 || !strings.Contains(pre[0].Diff, "serves GET /version") {
 		t.Errorf("pre-review requests = %+v", pre)
+	}
+	// ...the plan with its "Files to change", and the commits, oldest
+	// first, with the files each one touches.
+	pre := fx.agent.preReqs[0]
+	if !strings.Contains(pre.PRBody, "## Files to change\n- `version.go`") {
+		t.Errorf("pre-review PR body = %q", pre.PRBody)
+	}
+	if cs := pre.Commits; len(cs) != 2 || cs[0].Subject != "test: version endpoint" || cs[1].Subject != "feat: version endpoint" ||
+		!slices.Equal(cs[0].Files, []develop.FileChange{{Status: "A", Path: "version_test.go"}}) ||
+		!slices.Equal(cs[1].Files, []develop.FileChange{{Status: "A", Path: "version.go"}}) {
+		t.Errorf("pre-review commits = %+v", cs)
 	}
 	prComments := fx.gh.botCommentsOn(pr.Number)
 	if len(prComments) != 1 || !strings.Contains(prComments[0], "## Pre-review") {

@@ -57,6 +57,7 @@ type TestChange struct {
 
 type commit struct {
 	sha, subject string
+	merge        bool
 	files        []fileChange
 }
 
@@ -81,11 +82,58 @@ func CheckHistory(ctx context.Context, dir string, p project.Config, r Range) ([
 	return changes, nil
 }
 
+// CommitInfo is a commit of a branch and the files it touches. Its
+// subject is written by an agent: untrusted.
+type CommitInfo struct {
+	SHA     string
+	Subject string
+	Files   []FileChange
+}
+
+// FileChange is a file a commit touches, with its git status letter
+// (A, M, D...).
+type FileChange struct {
+	Status string
+	Path   string
+}
+
+// Commits lists the commits of base..tip, oldest first, with the files
+// each one touches.
+func Commits(ctx context.Context, dir, base, tip string) ([]CommitInfo, error) {
+	cs, err := walk(ctx, dir, base, tip)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CommitInfo, 0, len(cs))
+	for _, c := range cs {
+		ci := CommitInfo{SHA: c.sha, Subject: c.subject}
+		for _, f := range c.files {
+			ci.Files = append(ci.Files, FileChange{Status: f.status, Path: f.path})
+		}
+		out = append(out, ci)
+	}
+	return out, nil
+}
+
 func commits(ctx context.Context, dir string, r Range) ([]commit, error) {
 	if _, err := workspace.Git(ctx, dir, "merge-base", "--is-ancestor", r.Base, r.Tip); err != nil {
 		return nil, fail(CheckCommitOrder, "the branch does not start from %s", short(r.Base))
 	}
-	out, err := workspace.Git(ctx, dir, "rev-list", "--reverse", "--parents", r.Base+".."+r.Tip)
+	cs, err := walk(ctx, dir, r.Base, r.Tip)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cs {
+		if c.merge {
+			return nil, fail(CheckCommitOrder, "merge commit %s: the history must be linear", short(c.sha))
+		}
+	}
+	return cs, nil
+}
+
+// walk reads the commits of base..tip, oldest first.
+func walk(ctx context.Context, dir, base, tip string) ([]commit, error) {
+	out, err := workspace.Git(ctx, dir, "rev-list", "--reverse", "--parents", base+".."+tip)
 	if err != nil {
 		return nil, err
 	}
@@ -95,10 +143,7 @@ func commits(ctx context.Context, dir string, r Range) ([]commit, error) {
 		if len(f) == 0 {
 			continue
 		}
-		if len(f) > 2 {
-			return nil, fail(CheckCommitOrder, "merge commit %s: the history must be linear", short(f[0]))
-		}
-		c := commit{sha: f[0]}
+		c := commit{sha: f[0], merge: len(f) > 2}
 		if c.subject, err = workspace.Git(ctx, dir, "log", "-1", "--format=%s", c.sha); err != nil {
 			return nil, err
 		}

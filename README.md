@@ -62,7 +62,7 @@ permissions: Issues (read and write), Contents (read and write, to push
 Each project commits `.foreman.yml` at the root of its default branch:
 
 ```yaml
-skills_version: 0.1.0          # must equal the skills pack foreman ships
+skills_version: 0.2.0          # must equal the skills pack foreman ships
 agent: claude                  # the only agent supported for now
 commands:
   test: make test
