@@ -253,6 +253,11 @@ func TestTransitions(t *testing.T) {
 			want:         store.Closed,
 			wantComments: []string{"Closed: an authorized user chose `no-go`."},
 			wantAgent:    1, wantOpen: false,
+			check: func(t *testing.T, fx *fixture) {
+				if r := fx.gh.closeReason(); r != "not_planned" {
+					t.Errorf("closed as %q, want not_planned", r)
+				}
+			},
 		},
 		{
 			name: "out of scope is a recommendation, the issue stays open",

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -254,6 +255,31 @@ func TestIssuesAndEvents(t *testing.T) {
 	}
 	if err := c.RemoveLabel(ctx, repo, 1, "foreman:awaiting-go"); err != nil {
 		t.Fatalf("RemoveLabel of an absent label: %v", err)
+	}
+}
+
+func TestCloseIssueReason(t *testing.T) {
+	f := newFakeAPI(t)
+	var got []string
+	f.mux.HandleFunc("PATCH /repos/Bibzor/demo-api/issues/1", func(w http.ResponseWriter, r *http.Request) {
+		if !f.requireToken(w, r) {
+			return
+		}
+		var in map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Error(err)
+		}
+		got = append(got, in["state"]+" "+in["state_reason"])
+		_, _ = w.Write([]byte(`{}`))
+	})
+	c := f.client(func() time.Time { return f.expiresAt.Add(-time.Hour) })
+	for _, reason := range []string{github.ReasonCompleted, github.ReasonNotPlanned} {
+		if err := c.CloseIssue(context.Background(), repo, 1, reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"closed completed", "closed not_planned"}; !slices.Equal(got, want) {
+		t.Fatalf("bodies = %q, want %q", got, want)
 	}
 }
 

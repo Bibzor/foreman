@@ -44,8 +44,9 @@ type fakePR struct {
 
 type fakeIssue struct {
 	github.Issue
-	comments []github.Comment
-	events   []github.LabelEvent
+	comments    []github.Comment
+	events      []github.LabelEvent
+	closeReason string // the state_reason foreman closed it with
 }
 
 func newFakeGitHub(now func() time.Time) *fakeGitHub {
@@ -281,15 +282,21 @@ func (f *fakeGitHub) CreateComment(_ context.Context, repo config.Repo, n int, b
 	return id, nil
 }
 
-func (f *fakeGitHub) CloseIssue(_ context.Context, repo config.Repo, n int) error {
+func (f *fakeGitHub) CloseIssue(_ context.Context, repo config.Repo, n int, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	is, err := f.get(repo, n)
 	if err != nil {
 		return err
 	}
-	is.Open = false
+	is.Open, is.closeReason = false, reason
 	return nil
+}
+
+func (f *fakeGitHub) closeReason() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issues[key(repo, n)].closeReason
 }
 
 func (f *fakeGitHub) CreatePullRequest(_ context.Context, repo config.Repo, head, base, title, body string) (int, error) {

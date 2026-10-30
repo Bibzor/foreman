@@ -401,6 +401,9 @@ func TestAcceptanceOK(t *testing.T) {
 	if is.Open || !is.HasLabel("foreman:done") || is.HasLabel("acceptance-ok") {
 		t.Fatalf("issue = %+v", is)
 	}
+	if r := fx.gh.closeReason(); r != "completed" {
+		t.Fatalf("closed as %q, want completed", r)
+	}
 	if last := fx.lastComment(); !strings.Contains(last, "**Done.** @Bibzor accepted the change") ||
 		!strings.Contains(last, "The acceptance environment keeps running.") {
 		t.Fatalf("comment = %q", last)

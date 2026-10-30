@@ -217,11 +217,18 @@ func (c *Client) CreateComment(ctx context.Context, repo config.Repo, number int
 	return r.ID, nil
 }
 
-// CloseIssue closes an issue as not planned.
-func (c *Client) CloseIssue(ctx context.Context, repo config.Repo, number int) error {
+// Reasons an issue is closed for, GitHub's state_reason.
+const (
+	ReasonCompleted  = "completed"
+	ReasonNotPlanned = "not_planned"
+)
+
+// CloseIssue closes an issue for reason, ReasonCompleted or
+// ReasonNotPlanned.
+func (c *Client) CloseIssue(ctx context.Context, repo config.Repo, number int, reason string) error {
 	in := struct {
 		State       string `json:"state"`
 		StateReason string `json:"state_reason"`
-	}{"closed", "not_planned"}
+	}{"closed", reason}
 	return c.call(ctx, repo, http.MethodPatch, repoPath(repo, "issues", strconv.Itoa(number)), in, nil)
 }

@@ -48,7 +48,7 @@ type GitHub interface {
 	AddLabel(ctx context.Context, repo config.Repo, number int, label string) error
 	RemoveLabel(ctx context.Context, repo config.Repo, number int, label string) error
 	CreateComment(ctx context.Context, repo config.Repo, number int, body string) (int64, error)
-	CloseIssue(ctx context.Context, repo config.Repo, number int) error
+	CloseIssue(ctx context.Context, repo config.Repo, number int, reason string) error
 
 	CreatePullRequest(ctx context.Context, repo config.Repo, head, base, title, body string) (int, error)
 	PullRequestsByHead(ctx context.Context, repo config.Repo, branch string) ([]github.PullRequest, error)
@@ -407,7 +407,12 @@ func (e *Engine) effect(ctx context.Context, repo config.Repo, o store.Outbox) e
 		}
 	}
 	if o.Close {
-		if err := e.GitHub.CloseIssue(ctx, repo, o.Number); err != nil {
+		// Done is an accepted change; every other close (no-go) is not.
+		reason := github.ReasonNotPlanned
+		if o.State == store.Done {
+			reason = github.ReasonCompleted
+		}
+		if err := e.GitHub.CloseIssue(ctx, repo, o.Number, reason); err != nil {
 			return err
 		}
 	}
