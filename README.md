@@ -1,10 +1,11 @@
 # foreman
 
 A single Go binary that orchestrates AI coding agents over GitHub issues.
-Today it takes an issue from opt-in to a go / no-go decision, then has
-the agent develop it into a pull request ready for human review, and
-follows that review until the PR is merged. Acceptance after the merge
-comes next. It also ships the skills pack those agents use.
+It takes an issue from opt-in to a go / no-go decision, has the agent
+develop it into a pull request ready for human review, follows that
+review until the PR is merged, deploys the merged commit to an
+acceptance environment and closes the issue once an authorized user
+accepts the change. It also ships the skills pack those agents use.
 
 ## Skills
 
@@ -81,57 +82,119 @@ redirections. A path in `protected_paths` ending in `/` covers everything
 under it; any other is an exact file. `skills_version` must equal the
 pack foreman ships, otherwise: "project pins X, foreman ships Y".
 
+### Acceptance configuration
+
+An optional `acceptance` section describes the project's acceptance
+environment. foreman builds and runs it itself: nothing in it is a
+command.
+
+```yaml
+acceptance:
+  dockerfile: Dockerfile          # optional, default Dockerfile
+  build_args: {VITE_API_URL: "http://localhost:18080"}   # optional
+  container_port: 8080
+  host_port: 18080                # fixed per project
+  env: {ALLOWED_ORIGINS: "http://localhost:18081"}       # optional
+  smoke:
+    - {path: /healthz, status: 200}
+```
+
+| Field | Rule |
+|-------|------|
+| `dockerfile` | A clean relative path to a file inside the repository: no leading `/`, no `..`, no glob. At deploy time it must be a regular file inside the clone once symlinks are resolved. |
+| `build_args`, `env` | Names match `^[A-Z_][A-Z0-9_]*$`; values are on one line (no newline, carriage return or NUL). They are committed, so they are not secrets. |
+| `container_port` | 1 to 65535, required. |
+| `host_port` | 1024 to 65535, required. Bound to `127.0.0.1` only. Give each project its own: a port already in use fails the run and blocks the issue. |
+| `smoke` | 1 to 10 checks. `path` starts with `/` and has no space or control character; `status` is an HTTP status (100 to 599). |
+
+Unknown keys are refused, as everywhere in the file. Without an
+`acceptance` section, a merged change goes straight to `in-acceptance`
+and a human checks it on their own environment.
+
+With the Docker backend, foreman runs, as argv and never through a shell:
+
+```sh
+docker build --label foreman.repo=<owner>/<repo> --label foreman.issue=<n> --label foreman.sha=<sha> \
+  [--build-arg K=V ...] -t foreman-acc/<owner>-<repo>:<short sha> -f <clone>/<dockerfile> <clone>
+docker ps -aq --filter label=foreman.repo=<owner>/<repo>    # then docker rm -f on each: the previous deployment
+docker run -d --name foreman-acc-<owner>-<repo> --label ... -p 127.0.0.1:<host_port>:<container_port> \
+  [-e K=V ...] --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+  --memory 512m --pids-limit 256 foreman-acc/<owner>-<repo>:<short sha>
+```
+
+The smoke checks then poll `http://127.0.0.1:<host_port><path>` until each
+one answers its status, 60 seconds in all. On success the container keeps
+running: it is the project's shared acceptance environment, at
+`http://localhost:<host_port>`, until the next merged change replaces it.
+
+#### Deployment backends
+
+The state machine knows only the `acceptance.Deployer` interface
+([`internal/acceptance`](internal/acceptance)): `Deploy` builds and
+starts the merged commit in place of the previous deployment, `Smoke`
+runs the checks, `Stop` removes a deployment. Docker
+([`internal/acceptance/docker`](internal/acceptance/docker)) is the only
+implementation today. **Next step:** a Kubernetes (kind) deployer behind
+the same interface, without touching the state machine.
+
 ### Labels
 
 Created on start when missing: `foreman` (opt-in), `foreman:qualifying`,
 `foreman:needs-info`, `foreman:awaiting-go`, `foreman:queued`,
 `foreman:in-progress`, `foreman:in-review`, `foreman:merged`,
-`foreman:blocked`, `foreman:suspect`, `go`, `no-go`, `retry`, and
-`foreman:high-risk`, which goes on pull requests.
+`foreman:deploying`, `foreman:in-acceptance`, `foreman:done`,
+`foreman:blocked`, `foreman:suspect`, `go`, `no-go`, `retry`,
+`acceptance-ok`, `acceptance-ko`, and `foreman:high-risk`, which goes on
+pull requests.
 
 A label counts only if the latest `labeled` event for it is by an
 authorized user. Otherwise foreman ignores it and says so in one comment.
-`go`, `no-go` and `retry` must also be added after the comment that
+`go`, `no-go`, `retry`, `acceptance-ok` and `acceptance-ko` must also be
+added after the comment that
 announced the current state, both times taken from GitHub's clock. The `foreman:*`
 label of an issue mirrors the state stored in the database
 (`data_dir/foreman.db`), which is the source of truth.
 
 ### States
 
+```mermaid
+stateDiagram-v2
+    [*] --> qualifying: foreman label (authorized)
+    qualifying --> awaiting_go: ready / out_of_scope
+    qualifying --> needs_info: needs_info (rounds 1-3)
+    qualifying --> suspect: suspicious
+    qualifying --> blocked: agent failure, invalid output twice, 4th needs_info
+    needs_info --> qualifying: comment by the author or an authorized user
+    suspect --> awaiting_go: go
+    awaiting_go --> qualifying: issue changed since qualification
+    awaiting_go --> queued: go
+    awaiting_go --> closed: no-go
+    queued --> in_progress: fewer than wip_limit in progress or in review
+    in_progress --> in_review: checks pass, PR opened
+    in_progress --> blocked: agent failed, a check failed, .foreman.yml invalid
+    in_review --> in_review: pre-review, revision (at most 2)
+    in_review --> merged: PR merged
+    in_review --> blocked: PR closed unmerged, 3rd changes request
+    merged --> deploying: final commit approved, acceptance section
+    merged --> in_acceptance: final commit approved, no acceptance section
+    merged --> blocked: no approval of the final commit
+    deploying --> in_acceptance: built, started, smoke checks pass
+    deploying --> blocked: build, run or smoke failed, backend down 5 times
+    in_acceptance --> done: acceptance-ok
+    in_acceptance --> queued: acceptance-ko with feedback (rounds 1-2), new branch
+    in_acceptance --> blocked: 3rd acceptance-ko
+    blocked --> queued: retry, blocked from in-progress
+    blocked --> qualifying: retry
+    blocked --> in_review: retry
+    blocked --> merged: retry
+    blocked --> deploying: retry
+    blocked --> in_acceptance: retry
+    done --> [*]: issue closed
+    closed --> [*]
 ```
-           foreman label (authorized)
-                    |
-                    v
-   +--------> qualifying ----------------------> blocked
-   |           |     |     \   (agent failure, invalid output twice,
-   |           |     |      \   3 rounds of questions)
-   |           |     |       v
-   |           |     |      suspect --go--> (stored result) --+
-   |           |     v                                        |
-   |  answer   |   needs-info                                 |
-   +-----------+---- (author or authorized user comments)     |
-   |           v                                              |
-   |       awaiting-go <--------------------------------------+
-   |        |       |
-   | changed|  go   | no-go
-   +--------+       +-------> closed (issue closed)
-                |
-                v
-              queued  (waits while wip_limit issues are in progress or in review)
-                |
-                v
-           in-progress ------------------------> blocked
-                |        (agent failed, invalid output twice,
-                |         a check failed, .foreman.yml missing or invalid)
-                v
-            in-review  <--- changes requested by an authorized user:
-             |     |        one revision, at most 2 ----> blocked
-             |     +--- PR closed without merge --------> blocked
-             v
-           merged  (the issue stays open until acceptance)
 
-           blocked --retry (authorized)--> the state it was blocked from
-```
+State names use `_` in the diagram for `-`: `needs_info` is `needs-info`,
+and so on. Any tracked issue closed by a human goes to `closed`.
 
 - **qualifying**: fresh shallow clone, skills installed and verified,
   Claude Code runs the `foreman-qualify` skill on the issue.
@@ -154,12 +217,15 @@ label of an issue mirrors the state stored in the database
   repositories together, are in progress or in review. Otherwise foreman
   says why, once.
 - **in-progress**: a fresh clone of the default branch, a new branch
-  `foreman/<issue>`. Claude Code gets the stored snapshot inside
+  `foreman/<issue>`, or `foreman/<issue>-r<k>` after the k-th
+  `acceptance-ko`. Claude Code gets the stored snapshot inside
   `<untrusted_issue>`, the approved summary and acceptance criteria as
   trusted input, and follows `foreman-plan`, `foreman-tdd`,
   `foreman-fix-loop` and `foreman-review-guide`. It ends with a JSON
   object `{status, plan, review_guide, failure_report}`, validated like
-  the qualification output. Text it writes before that object goes to the
+  the qualification output. After an `acceptance-ko` it also gets the
+  feedback comment inside `<untrusted_feedback>`, and is told that the
+  default branch already holds the rejected implementation. Text it writes before that object goes to the
   PR under "Agent notes", quoted as untrusted plain text. Then foreman checks the branch itself,
   without trusting the agent; any failure blocks the issue and names the
   check:
@@ -175,12 +241,16 @@ label of an issue mirrors the state stored in the database
   the plan and the review guide, and `Refs #<issue>`, never `Closes`, so
   the issue stays open until acceptance.
 - **in-review**: right after the PR opens, a separate Claude Code run, in
-  a fresh session with read-only tools, runs `foreman-prereview` on the
-  diff and the acceptance criteria and posts its findings on the PR. A
+  a fresh session with read-only tools, runs `foreman-prereview` and posts
+  its findings on the PR. It gets the acceptance criteria, the diff, the
+  PR description (the plan, with "Files to change") inside
+  `<untrusted_pr_body>`, and the commit list of the branch, with the files
+  each commit touches, computed by foreman with git, inside
+  `<untrusted_commits>`: it checks scope and commit order from them. A
   `high` finding, a pre-review that could not run, or a change to a
   dependency file or an authentication-related path adds
   `foreman:high-risk` to the PR. Then:
-  - PR merged: **merged**. Nothing more happens today.
+  - PR merged: **merged**, with its merge commit recorded.
   - PR closed without merge: **blocked**.
   - a review requesting changes by an authorized user: one revision run
     on the existing branch, with the review as untrusted input, the same
@@ -189,11 +259,51 @@ label of an issue mirrors the state stored in the database
     only, and the comment lists every test file changed. A third request
     for changes blocks the issue. Reviews by anyone else are ignored.
 
+- **merged**: first a deterministic approval check, which fails closed.
+  Among the reviews by authorized users, comments and pending reviews are
+  ignored, as GitHub does. The last remaining one must be `APPROVED`, and
+  its commit must be the PR's final head commit. Otherwise the issue is
+  **blocked** with "merged without an approval of the final commit".
+  This covers no approval, an approval of an older commit, an approval
+  by an unauthorized user only, and a later changes request or dismissed
+  approval. Then foreman makes a fresh clone of the default branch at
+  the merge commit and reads its `.foreman.yml`. With an `acceptance`
+  section the issue goes to **deploying**; without one it goes straight
+  to **in-acceptance**, with a comment saying there is no automated
+  environment. An issue merged before foreman recorded merge commits
+  gets the merge commit from the PR.
+- **deploying**: from a fresh clone at the merge commit, the deployer
+  builds the change, replaces the repository's previous deployment,
+  starts it and runs the smoke checks (see
+  [Acceptance configuration](#acceptance-configuration)). Success goes to
+  **in-acceptance**, with a comment giving the URL
+  `http://localhost:<host_port>`, the deployed sha and "Check the change,
+  then add `acceptance-ok` or `acceptance-ko` with a comment explaining
+  what is wrong." A failed build, run or smoke check goes to **blocked**,
+  with the end of the log, credentials redacted. After a failed smoke
+  check the deployment is removed. If the backend (the Docker daemon) is
+  unreachable, foreman retries on the next cycle and blocks after 5
+  failures in a row.
+- **in-acceptance**: an authorized `acceptance-ok` goes to **done**: the
+  issue is closed with a comment and the deployment keeps running, as the
+  shared acceptance environment. An authorized `acceptance-ko` needs
+  feedback: the newest comment by an authorized user posted after the
+  comment that started `in-acceptance`. Without one, foreman asks for it
+  once and waits. With one, the issue goes back to **queued**, with
+  `acceptance_rounds` incremented. The next development starts a new
+  branch `foreman/<issue>-r<k>` from the default branch, which holds the
+  merged change, and gets the feedback. The merged PR is never reopened. A
+  third `acceptance-ko` (after 2 rounds) blocks the issue.
+- **done**: accepted and closed. foreman no longer tracks it.
 - **blocked**: a human looks at the reason in the comment. When the cause
   is fixed, an authorized user adds `retry`: the issue goes back to the
   state it was blocked from and runs that step again from a fresh
-  workspace, and the label is removed. A `retry` from anyone else, or
-  added before the issue was blocked, is ignored.
+  workspace, and the label is removed. A failed development goes back
+  through **queued**, so the WIP limit applies. When the block was a
+  limit, retry resets the counter that reached it and the comment names
+  it: `needs_info_rounds`, `revision_rounds`, `prep_failures` (failures in
+  a row) or `acceptance_rounds`. A `retry` from anyone else, or added
+  before the issue was blocked, is ignored.
 
 Agent output (qualification, development, pre-review) may start with
 free text. foreman takes the last top-level JSON object, bare or in a
@@ -216,13 +326,26 @@ error.
   the network. The restrictions below apply to the agent's tools, not to
   the code those commands run. Run foreman as a dedicated user with
   nothing else to lose. Container isolation comes in the next step.
-- The issue text, review comments, the diff and commit messages are
-  untrusted. Before they reach an agent, invisible characters are shown
-  as `<U+XXXX>` and the `untrusted_issue`, `untrusted_review` and
-  `untrusted_diff` delimiters are neutralized, so the text cannot close
-  its block. Checks in Go (HTML comments, zero-width, bidi and tag
-  characters, long base64-looking blobs, the delimiter names) force
-  `suspicious` whatever the agent says. Agent-written text posted on
+- **Acceptance builds and runs the merged code.** `docker build` runs the
+  project's Dockerfile, and the container runs the merged change. foreman
+  deploys only a merge commit whose final PR commit an authorized user
+  approved. The container is published on `127.0.0.1` only, with a
+  read-only root filesystem (a tmpfs `/tmp`), every capability dropped,
+  `no-new-privileges`, and memory and process limits. It still has the
+  network access Docker gives it by default. docker is run as argv with
+  arguments foreman builds from the validated `acceptance` section, and
+  with an environment reduced to `PATH`, `HOME` and the `DOCKER_*`
+  client variables. Access to the Docker daemon amounts to root on the
+  host: keep that in mind when choosing the user that runs foreman.
+- The issue text, review comments, acceptance feedback, the PR
+  description, the diff and commit messages are untrusted. Before they
+  reach an agent, invisible characters are shown as `<U+XXXX>`, and the
+  `untrusted_issue`, `untrusted_review`, `untrusted_diff`,
+  `untrusted_pr_body`, `untrusted_commits` and `untrusted_feedback`
+  delimiters are neutralized, so the text cannot close its block. Checks
+  in Go (HTML comments, zero-width, bidi and tag characters, long
+  base64-looking blobs, the delimiter names) force `suspicious` whatever
+  the agent says. Agent-written text posted on
   GitHub has HTML comments and mentions neutralized.
 - The installation token is given to the `git clone`, `git fetch` and
   `git push` processes only, as an HTTP header in their environment. It
