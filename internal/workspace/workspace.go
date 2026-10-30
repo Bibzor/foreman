@@ -51,9 +51,11 @@ type Dirs struct {
 	// BaseBranch is the default branch and Base the commit cloned from it.
 	BaseBranch string
 	Base       string
-	// ProjectFile is .foreman.yml at Base, nil when there is none. It is
-	// read before any branch is checked out.
+	// ProjectFile is .foreman.yml at ProjectSHA, the tip of the default
+	// branch when cloned (which is Base, except for PrepareAt), nil when
+	// there is none. It is read before any branch is checked out.
 	ProjectFile []byte
+	ProjectSHA  string
 }
 
 // Workspace prepares workspaces under DataDir.
@@ -89,6 +91,7 @@ func (w *Workspace) Prepare(ctx context.Context, repo config.Repo, number int) (
 	if d.ProjectFile, err = projectFile(ctx, d.Workdir); err != nil {
 		return Dirs{}, err
 	}
+	d.ProjectSHA = d.Base
 	if err := w.skills(d.SkillsDir); err != nil {
 		return Dirs{}, err
 	}
@@ -155,8 +158,9 @@ func (w *Workspace) PrepareBranch(ctx context.Context, repo config.Repo, number 
 
 // PrepareAt prepares a workspace at commit sha of the default branch,
 // such as a merge commit: a fresh clone of the default branch, then sha
-// fetched and checked out, detached. ProjectFile and Base are those of
-// sha.
+// fetched and checked out, detached. Base is sha; ProjectFile stays the
+// one of the default branch's tip, ProjectSHA, so a configuration
+// updated after sha applies.
 func (w *Workspace) PrepareAt(ctx context.Context, repo config.Repo, number int, sha string) (Dirs, error) {
 	d, err := w.Prepare(ctx, repo, number)
 	if err != nil {
@@ -178,9 +182,6 @@ func (w *Workspace) PrepareAt(ctx context.Context, repo config.Repo, number int,
 			return Dirs{}, err
 		}
 		if d.Base, err = Git(ctx, d.Workdir, "rev-parse", "HEAD"); err != nil {
-			return Dirs{}, err
-		}
-		if d.ProjectFile, err = projectFile(ctx, d.Workdir); err != nil {
 			return Dirs{}, err
 		}
 	}
@@ -302,7 +303,9 @@ func git(ctx context.Context, dir string, extraEnv, secrets []string, args ...st
 // redacted from its error output.
 func gitOut(ctx context.Context, dir string, extraEnv, secrets []string, args ...string) (string, error) {
 	sub := args[0]
-	args = append([]string{"-c", "core.hooksPath=" + os.DevNull}, args...)
+	// No background gc or maintenance: it would write in .git while
+	// scanForSecrets reads it.
+	args = append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // fixed binary; args are built here, the URL from validated config
 	cmd.Dir = dir
 	cmd.Env = append([]string{

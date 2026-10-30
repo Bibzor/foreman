@@ -24,9 +24,10 @@ const checkAndLabel = "Check the change, then add `" + LabelAcceptanceOK + "` or
 	"` with a comment explaining what is wrong."
 
 // merged checks that an authorized user approved the final commit of the
-// pull request, then reads .foreman.yml at the merge commit: with an
-// acceptance section the change is deployed, otherwise a human checks it
-// on their own.
+// pull request, then reads .foreman.yml at the tip of the default branch,
+// so a configuration updated after the merge applies: with an acceptance
+// section the change is deployed, otherwise a human checks it on their
+// own.
 func (e *Engine) merged(ctx context.Context, c *Case) (*Transition, error) {
 	if c.Issue.PRNumber == 0 {
 		return nil, errors.New("merged without a recorded pull request")
@@ -58,7 +59,7 @@ func (e *Engine) merged(ctx context.Context, c *Case) (*Transition, error) {
 	}
 	// Only for .foreman.yml: deploying prepares its own clone, so a
 	// restart or a retry starts clean.
-	_, p, t, err := e.acceptanceWorkspace(ctx, c, sha)
+	dirs, p, t, err := e.acceptanceWorkspace(ctx, c, sha)
 	if t != nil || err != nil {
 		if t != nil {
 			t.Update = setSHA
@@ -66,20 +67,28 @@ func (e *Engine) merged(ctx context.Context, c *Case) (*Transition, error) {
 		return t, err
 	}
 	if p.Acceptance == nil {
-		return &Transition{
-			To:     store.InAcceptance,
-			Reason: "no acceptance environment",
-			Comment: fmt.Sprintf("**In acceptance.** There is no automated acceptance environment (no `acceptance` section "+
-				"in `%s`), so foreman deployed nothing. %s", project.File, checkAndLabel),
-			Update: setSHA,
-		}, nil
+		t := noEnvironment(dirs)
+		t.Update = setSHA
+		return t, nil
 	}
 	return &Transition{
-		To:      store.Deploying,
-		Reason:  "approved and merged",
-		Comment: fmt.Sprintf("**Deploying.** foreman deploys the merge commit `%s` to the acceptance environment.", short(sha)),
-		Update:  setSHA,
+		To:     store.Deploying,
+		Reason: "approved and merged",
+		Comment: fmt.Sprintf("**Deploying.** foreman deploys the merge commit `%s` to the acceptance environment, "+
+			"configured by `%s` at `%s`.", short(sha), project.File, short(dirs.ProjectSHA)),
+		Update: setSHA,
 	}, nil
+}
+
+// noEnvironment goes to in-acceptance without deploying anything.
+func noEnvironment(dirs workspace.Dirs) *Transition {
+	return &Transition{
+		To:     store.InAcceptance,
+		Reason: "no acceptance environment",
+		Comment: fmt.Sprintf("**In acceptance.** There is no automated acceptance environment (no `acceptance` section "+
+			"in `%s` at `%s`, the tip of `%s`), so foreman deployed nothing. %s",
+			project.File, short(dirs.ProjectSHA), dirs.BaseBranch, checkAndLabel),
+	}
 }
 
 // unapproved returns why the reviews do not approve head, or "". As on
@@ -108,8 +117,10 @@ func (e *Engine) unapproved(reviews []github.Review, head string) string {
 	return ""
 }
 
-// acceptanceWorkspace prepares a fresh clone at the merge commit and
-// reads its .foreman.yml.
+// acceptanceWorkspace prepares a fresh clone at the merge commit, the
+// code to deploy, and reads .foreman.yml at the tip of the default
+// branch, which may be newer. No agent runs, so skills_version is not
+// checked: a project that bumped it after the merge still deploys.
 func (e *Engine) acceptanceWorkspace(ctx context.Context, c *Case, sha string) (workspace.Dirs, project.Config, *Transition, error) {
 	var dirs workspace.Dirs
 	if t, err := e.prepare(ctx, c, func() (err error) {
@@ -118,7 +129,7 @@ func (e *Engine) acceptanceWorkspace(ctx context.Context, c *Case, sha string) (
 	}); t != nil || err != nil {
 		return workspace.Dirs{}, project.Config{}, t, err
 	}
-	p, t := projectConfig(dirs)
+	p, t := deployConfig(dirs)
 	return dirs, p, t, nil
 }
 
@@ -132,8 +143,8 @@ func (e *Engine) deploying(ctx context.Context, c *Case) (*Transition, error) {
 	if t != nil || err != nil {
 		return t, err
 	}
-	if p.Acceptance == nil {
-		return nil, fmt.Errorf("%s at %s has no acceptance section any more", project.File, short(c.Issue.MergeSHA))
+	if p.Acceptance == nil { // removed from the default branch since merged ran
+		return noEnvironment(dirs), nil
 	}
 	spec := acceptance.Spec{Repo: c.Repo, Issue: c.Issue.Number, SHA: c.Issue.MergeSHA, Dir: dirs.Workdir, Config: *p.Acceptance}
 	dep, err := e.Deployer.Deploy(ctx, spec)
@@ -161,8 +172,9 @@ func (e *Engine) deploying(ctx context.Context, c *Case) (*Transition, error) {
 	return &Transition{
 		To:     store.InAcceptance,
 		Reason: "deployed " + short(dep.SHA),
-		Comment: fmt.Sprintf("**In acceptance.** foreman deployed the merge commit `%s` and its smoke checks pass: %s\n\n%s",
-			dep.SHA, dep.URL, checkAndLabel),
+		Comment: fmt.Sprintf("**In acceptance.** foreman deployed the merge commit `%s` and its smoke checks pass: %s\n\n"+
+			"- Deployed sha: `%s`\n- Configuration: `%s` at `%s`, the tip of `%s`\n\n%s",
+			short(dep.SHA), dep.URL, dep.SHA, project.File, dirs.ProjectSHA, dirs.BaseBranch, checkAndLabel),
 	}, nil
 }
 

@@ -99,9 +99,16 @@ var ErrMissing = errors.New(File + " is missing from the default branch")
 // that no shell or Claude Code permission rule gives a meaning to.
 var word = regexp.MustCompile(`^[A-Za-z0-9_./:=@%+,-]+$`)
 
-// Parse validates b. packVersion is the skills pack foreman ships: the
-// project must pin exactly that version.
-func Parse(b []byte, packVersion string) (Config, error) {
+// Parse validates b for a step that runs an agent. packVersion is the
+// skills pack foreman ships: the project must pin exactly that version.
+func Parse(b []byte, packVersion string) (Config, error) { return parse(b, packVersion, true) }
+
+// ParseNoPack validates b like Parse, except that skills_version may
+// pin any version: for the steps that run no agent, such as deploying,
+// the skills do not matter.
+func ParseNoPack(b []byte) (Config, error) { return parse(b, "", false) }
+
+func parse(b []byte, packVersion string, checkPack bool) (Config, error) {
 	if b == nil {
 		return Config{}, ErrMissing
 	}
@@ -117,7 +124,7 @@ func Parse(b []byte, packVersion string) (Config, error) {
 	switch {
 	case f.SkillsVersion == "":
 		errs = append(errs, errors.New("skills_version is required"))
-	case f.SkillsVersion != packVersion:
+	case checkPack && f.SkillsVersion != packVersion:
 		errs = append(errs, fmt.Errorf("project pins %s, foreman ships %s", f.SkillsVersion, packVersion))
 	}
 	if f.Agent == "" {

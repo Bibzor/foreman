@@ -79,8 +79,11 @@ the agent cannot change its own rules. A missing or invalid file blocks
 the issue with the reason. Commands are plain words (letters, digits and
 `_./:=@%+,-`) run as argv: no shell, quoting, variables, pipes or
 redirections. A path in `protected_paths` ending in `/` covers everything
-under it; any other is an exact file. `skills_version` must equal the
-pack foreman ships, otherwise: "project pins X, foreman ships Y".
+under it; any other is an exact file. For the steps that run an agent
+(qualification, development, revision, pre-review), `skills_version`
+must equal the pack foreman ships, otherwise: "project pins X, foreman
+ships Y". The acceptance steps (merged, deploying) run no agent and do
+not check it.
 
 ### Acceptance configuration
 
@@ -266,18 +269,23 @@ and so on. Any tracked issue closed by a human goes to `closed`.
   **blocked** with "merged without an approval of the final commit".
   This covers no approval, an approval of an older commit, an approval
   by an unauthorized user only, and a later changes request or dismissed
-  approval. Then foreman makes a fresh clone of the default branch at
-  the merge commit and reads its `.foreman.yml`. With an `acceptance`
+  approval. Then foreman makes a fresh clone of the default branch with
+  the merge commit checked out: that is the code it deploys. It reads
+  `.foreman.yml` at the current tip of the default branch, so a
+  configuration updated after the merge (a new `acceptance` section, a
+  new `skills_version`) applies. With an `acceptance`
   section the issue goes to **deploying**; without one it goes straight
   to **in-acceptance**, with a comment saying there is no automated
   environment. An issue merged before foreman recorded merge commits
   gets the merge commit from the PR.
-- **deploying**: from a fresh clone at the merge commit, the deployer
-  builds the change, replaces the repository's previous deployment,
-  starts it and runs the smoke checks (see
+- **deploying**: from a fresh clone at the merge commit, with
+  `.foreman.yml` read again at the tip of the default branch, the
+  deployer builds the change, replaces the repository's previous
+  deployment, starts it and runs the smoke checks (see
   [Acceptance configuration](#acceptance-configuration)). Success goes to
   **in-acceptance**, with a comment giving the URL
-  `http://localhost:<host_port>`, the deployed sha and "Check the change,
+  `http://localhost:<host_port>`, the deployed sha, the sha of the
+  configuration it used and "Check the change,
   then add `acceptance-ok` or `acceptance-ko` with a comment explaining
   what is wrong." A failed build, run or smoke check goes to **blocked**,
   with the end of the log, credentials redacted. After a failed smoke
