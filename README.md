@@ -72,6 +72,10 @@ commands:
 protected_paths: [.github/workflows/, AGENTS.md, .foreman.yml, go.mod, go.sum]
 test_paths: ["**/*_test.go"]   # globs; "**" matches any number of directories
 max_diff_lines: 400
+sandbox:                       # required to develop: see below
+  image: golang:1.27
+  setup: [go mod download]
+  cache: [/go/pkg]
 ```
 
 foreman reads it from the default branch, never from a work branch, so
@@ -84,6 +88,62 @@ under it; any other is an exact file. For the steps that run an agent
 must equal the pack foreman ships, otherwise: "project pins X, foreman
 ships Y". The acceptance steps (merged, deploying) run no agent and do
 not check it.
+
+### Sandbox configuration
+
+Every project command (the agent's tests and lint, foreman's own check,
+and the setup) runs in a throwaway Docker container, never on the host.
+The `sandbox` section is optional in the file but required to develop:
+without it, development and revisions are blocked with an example.
+
+```yaml
+sandbox:
+  image: golang:1.27              # name:tag (not latest) or name@sha256:<digest>
+  setup: [go mod download]        # optional: runs WITH network, before the agent
+  cache: [/go/pkg]                # optional: container paths filled by setup
+  env: {GOFLAGS: -mod=mod}        # optional: the only environment of the commands
+```
+
+| Field | Rule |
+|-------|------|
+| `image` | Required. A tag other than `latest`, or a `sha256` digest. |
+| `setup` | Up to 10 commands, validated like the project commands. They run before each development or revision, with network access, on a copy of the default branch (never the agent's clone), and fill the caches. |
+| `cache` | Up to 8 clean absolute container paths, none of `/`, `/work`, `/tmp` and nothing under `/tmp` or a `.git`. Each is a directory foreman owns on the host (`data_dir/cache/<owner>/<repo>/<issue>/<i>`), emptied before each setup, writable during setup and read-only afterwards. For Go use `/go/pkg` (the module cache and the checksum database), for npm a path under `/work`, such as `/work/node_modules`, mounted over the workspace. |
+| `env` | Like `acceptance.env`. `HOME` is `/tmp`. |
+
+The agent runs a project command as
+`<foreman> sandbox exec --data-dir <data_dir> <test|lint|N>` (`N` is the
+index of an `extra` command); that exact command line, with the absolute
+path of the foreman binary, is the only Bash rule it has for project
+commands. `foreman sandbox exec` reads the spec foreman wrote in the
+plugin directory, outside the clone (`data_dir/skills/.../sandbox.json`,
+named by `FOREMAN_SANDBOX_SPEC`), and refuses a spec that, symlinks
+resolved, is not under `<data_dir>/skills/`, not a regular file owned by
+the current user with mode `0600`, or that names a workspace or cache
+outside `data_dir`. foreman's own check runs the same commands in the
+clone it owns.
+
+Each command is one `docker run`, as argv and never through a shell:
+
+```sh
+docker run --rm --name foreman-sbx-<owner>-<repo>-<n>-<random> --label foreman.sandbox=exec ... \
+  --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=2g --cap-drop ALL --security-opt no-new-privileges \
+  --user <uid>:<gid> --memory 4g --memory-swap 4g --cpus 2 --pids-limit 1024 \
+  --workdir /work --env HOME=/tmp [--env K=V ...] --network none \
+  --mount type=bind,src=<clone>,dst=/work \
+  --mount type=bind,src=<clone>/.git,dst=/work/.git,readonly \
+  --mount type=bind,src=<cache>,dst=<path>,readonly ... \
+  --entrypoint <argv0> <image> <args...>
+```
+
+Setup is the same with `--network bridge`, the copy of the default branch
+at `/work` and the caches writable. A command gets 10 minutes from the
+agent (Claude Code's longest Bash timeout), 15 from foreman's check, 20
+for a setup command; on timeout the container is removed. After each
+agent run, foreman removes any sandbox container of the issue still
+running. The paths of the foreman binary and of `data_dir` go into
+permission rules and mounts unquoted, so foreman refuses to start unless
+they are made of letters, digits and `_.@+-`.
 
 ### Acceptance configuration
 
@@ -327,13 +387,29 @@ error.
 
 ### Security notes
 
-- **Tests and lint now execute code written by the agent, on this host,
-  as the local user, without isolation.** That code can read and change
-  anything the user can: the GitHub App private key, the foreman
-  database, other repositories' workspaces, SSH keys. It can also reach
-  the network. The restrictions below apply to the agent's tools, not to
-  the code those commands run. Run foreman as a dedicated user with
-  nothing else to lose. Container isolation comes in the next step.
+- **Project code runs only in the sandbox.** Every command that executes
+  project code (the agent's tests and lint, foreman's own check, and the
+  setup) runs in a container (see
+  [Sandbox configuration](#sandbox-configuration)). Only the clone is
+  mounted, at `/work`, with its `.git` read-only. Neither the rest of the
+  host (the GitHub App private key, the foreman database, other
+  workspaces, SSH keys) nor the host's environment reaches it. The
+  commands have no network. The caches are read-only, the root
+  filesystem is read-only, the user is not root, every capability is
+  dropped, and memory, CPU, processes and time are limited.
+- **What the sandbox does not cover:**
+  - **The agent process itself runs on the host**, as the local user,
+    with that user's network access. Only its tools are confined: by
+    `--restricted`, the allow rules and the `.git` deny rules below.
+  - **Setup has the network.** It runs commands from the default
+    branch, which a human merged, never the agent's work.
+  - **The workspace is writable from the sandbox.** Code the agent wrote
+    can change any file of the clone but `.git`, as the agent itself
+    can. foreman checks only what is committed, from its own clone.
+  - **Access to the Docker daemon amounts to root on the host.** The
+    user that runs foreman, and so the agent through
+    `foreman sandbox exec`, can reach it. foreman only ever runs the
+    commands above, but choose that user with this in mind.
 - **Acceptance builds and runs the merged code.** `docker build` runs the
   project's Dockerfile, and the container runs the merged change. foreman
   deploys only a merge commit whose final PR commit an authorized user
@@ -358,19 +434,37 @@ error.
 - The installation token is given to the `git clone`, `git fetch` and
   `git push` processes only, as an HTTP header in their environment. It
   is never on the command line, in a remote URL or in `.git/config`, and
-  `.git` is scanned for it afterwards. The agent's environment and the
-  test and lint commands' environment are rebuilt from allowlists, so no
-  GitHub credential reaches them.
+  `.git` is scanned for it afterwards. The agent's environment is
+  rebuilt from an allowlist, and the sandbox gets none of the host's, so
+  no GitHub credential reaches them.
 - Claude Code runs with `--restricted`, a turn limit and a timeout.
   `--restricted` confines the file tools to the clone (symlinks pointing
   outside included) and ignores the repository's own `.claude` settings,
   hooks and MCP servers. The skills are loaded with `--plugin-dir` from a
   verified directory outside the clone. Qualification and pre-review get
   `Read, Grep, Glob, Skill`. Development gets `Read, Grep, Glob, Edit,
-  Write, Skill`, and `Bash` only for the project commands, verbatim, and
-  `git add`, `git commit`, `git status`, `git diff`, `git log`. No push,
-  no `gh`, no web tools. Its git runs with no user configuration and no
-  hooks.
+  Write, Skill`. Its `Bash` is limited to
+  `<foreman> sandbox exec --data-dir <data_dir> <name>` for each project
+  command, and to `git --no-pager status`, `git --no-pager diff
+  --no-ext-diff`, `git --no-pager log --no-ext-diff`, `git --no-pager
+  add`, `git --no-pager commit`. Raw `make`, `go`, `npm`, push, `gh` and
+  web tools are not allowed.
+- **`.git` is out of the agent's reach.** Options in `.git/config`
+  (`core.fsmonitor`, `core.pager`, `diff.external`, `filter.*`,
+  `core.hooksPath`...) make git run a command, so:
+  - the file tools are denied `Read`, `Edit` and `Write` on the clone's
+    `.git` (deny rules passed to Claude Code, for the path as given and
+    with symlinks resolved);
+  - the sandbox mounts `.git` read-only, so code the agent wrote cannot
+    change it either;
+  - every git process foreman starts, for itself or for the agent, reads
+    no system or global configuration and gets, through
+    `GIT_CONFIG_COUNT`, which takes precedence over `.git/config`:
+    `core.fsmonitor=false`, `core.hooksPath=/dev/null`, `core.pager=cat`,
+    `diff.external=true` (git cannot unset it, and an empty value fails:
+    `true` makes an external diff print nothing, and patches are asked
+    for with `--no-ext-diff`), `core.editor=true`,
+    `sequence.editor=true`, and no commit or tag signing.
 - foreman never runs git in the agent's clone after the agent ran. It
   clones the branch into a directory it owns, so only committed history
   crosses over: the agent's `.git` configuration, hooks and uncommitted
@@ -378,9 +472,6 @@ error.
   pushes the exact commit it checked.
 - `.foreman.yml` is read from the default branch. Commands run as argv,
   never through a shell.
-- **The agent itself is not isolated either.** It runs as the local user,
-  with that user's permissions and network access. The barriers above
-  are the only ones today.
 
 ## Usage
 
@@ -389,8 +480,13 @@ foreman run [--config path] [--once]
 foreman skills install --agent claude --target path/to/repo
 foreman skills verify --target path/to/repo
 foreman skills list
+foreman sandbox exec --data-dir <data_dir> <test|lint|N>
 foreman version
 ```
+
+`sandbox exec` is what the agent runs; it is not meant to be run by hand.
+It reads the spec named by `FOREMAN_SANDBOX_SPEC`, runs one command in
+the sandbox, streams its output and exits with its status.
 
 `install` writes the skills to `.claude/skills/`, records the version and
 the sha256 of every file in `.foreman/skills.lock`, and adds both
