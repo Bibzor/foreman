@@ -5,13 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Bibzor/foreman/internal/project"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/workspace"
 )
 
@@ -306,61 +304,32 @@ func ChangedFiles(ctx context.Context, dir, base, tip string) ([]string, error) 
 	return strings.Split(out, "\n"), nil
 }
 
-// CommandTimeout bounds each project command foreman runs.
-const CommandTimeout = 15 * time.Minute
-
 // RunCommands runs the project's test command, then its lint command, in
-// dir. They run as argv, never through a shell, with an environment that
-// carries no credential.
-//
-// They execute code the agent wrote, on the host, as the local user.
-func RunCommands(ctx context.Context, dir string, p project.Config) error {
-	for _, c := range []struct {
-		check string
-		cmd   project.Command
-	}{{CheckTest, p.Test}, {CheckLint, p.Lint}} {
-		if err := runCommand(ctx, dir, c.check, c.cmd); err != nil {
-			return err
+// the sandbox of s, whose workspace is a clone foreman owns. A command
+// that fails or times out fails its check; a sandbox that cannot run is
+// an error.
+func RunCommands(ctx context.Context, sb sandbox.Sandbox, s sandbox.Spec) error {
+	for _, c := range []struct{ check, name string }{{CheckTest, "test"}, {CheckLint, "lint"}} {
+		cmd, ok := s.Command(c.name)
+		if !ok {
+			return fmt.Errorf("sandbox spec has no %s command", c.name)
+		}
+		raw := strings.Join(cmd.Argv, " ")
+		var out bytes.Buffer
+		err := sb.Exec(ctx, s, c.name, &out)
+		var ee *sandbox.ExitError
+		switch {
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case errors.Is(err, sandbox.ErrTimeout):
+			return fail(c.check, "`%s` timed out after %s", raw, s.Timeout())
+		case errors.As(err, &ee):
+			return fail(c.check, "`%s`: %v\n%s", raw, err, tail(out.String(), 3000))
+		case err != nil:
+			return fmt.Errorf("sandbox: %w: %s", err, tail(out.String(), 1000))
 		}
 	}
 	return nil
-}
-
-func runCommand(ctx context.Context, dir, check string, c project.Command) error {
-	ctx, cancel := context.WithTimeout(ctx, CommandTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, c.Argv[0], c.Argv[1:]...) //nolint:gosec // argv validated by project.Parse, no shell
-	cmd.Dir = dir
-	cmd.Env = commandEnv(os.Environ())
-	cmd.WaitDelay = 5 * time.Second
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	err := cmd.Run()
-	switch {
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return fail(check, "`%s` timed out after %s", c, CommandTimeout)
-	case err != nil:
-		return fail(check, "`%s`: %v\n%s", c, err, tail(out.String(), 3000))
-	}
-	return nil
-}
-
-// commandEnv keeps what a build needs from environ: nothing that could
-// carry a credential.
-func commandEnv(environ []string) []string {
-	var out []string
-	for _, kv := range environ {
-		name, _, _ := strings.Cut(kv, "=")
-		switch name {
-		case "PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TERM":
-			out = append(out, kv)
-		default:
-			if strings.HasPrefix(name, "LC_") {
-				out = append(out, kv)
-			}
-		}
-	}
-	return out
 }
 
 func tail(s string, n int) string {

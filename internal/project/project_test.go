@@ -166,6 +166,78 @@ func TestParseAcceptanceErrors(t *testing.T) {
 	}
 }
 
+const sandbox = `sandbox:
+  image: golang:1.27
+  setup: [go mod download, go  build ./...]
+  cache: [/go/pkg/mod, /work/node_modules]
+  env: {GOFLAGS: -mod=mod}
+`
+
+func TestParseSandbox(t *testing.T) {
+	c, err := project.Parse([]byte(valid), pack)
+	if err != nil || c.Sandbox != nil {
+		t.Fatalf("no section: %+v %v", c.Sandbox, err)
+	}
+	c, err = project.Parse([]byte(valid+sandbox), pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Sandbox
+	if s == nil || s.Image != "golang:1.27" || len(s.Setup) != 2 || s.Setup[1].Raw != "go build ./..." ||
+		!slices.Equal(s.Cache, []string{"/go/pkg/mod", "/work/node_modules"}) || s.Env["GOFLAGS"] != "-mod=mod" {
+		t.Fatalf("sandbox = %+v", s)
+	}
+	for _, img := range []string{
+		"node:22.11-bookworm",
+		"ghcr.io/acme/builder:v1",
+		"localhost:5000/acme/go:1.27",
+		"golang@sha256:" + strings.Repeat("ab", 32),
+	} {
+		c, err := project.Parse([]byte(valid+"sandbox: {image: \""+img+"\"}\n"), pack)
+		if err != nil || c.Sandbox.Image != img || c.Sandbox.Setup != nil || c.Sandbox.Cache != nil {
+			t.Errorf("%s: %+v %v", img, c.Sandbox, err)
+		}
+	}
+}
+
+func TestParseSandboxErrors(t *testing.T) {
+	tests := []struct {
+		name, old, new, want string
+	}{
+		{"unknown key", "  image: golang:1.27\n", "  image: golang:1.27\n  privileged: true\n", "field privileged not found"},
+		{"no image", "  image: golang:1.27\n", "", "sandbox.image"},
+		{"untagged", "golang:1.27", "golang", "with a tag or a sha256 digest"},
+		{"latest", "golang:1.27", "golang:latest", "not latest"},
+		{"short digest", "golang:1.27", "golang@sha256:abc", "sandbox.image"},
+		{"option as image", "golang:1.27", "--privileged", "sandbox.image"},
+		{"upper-case image", "golang:1.27", "Golang:1.27", "sandbox.image"},
+		{"setup pipe", "go mod download", "curl x | sh", "no shell syntax"},
+		{"setup option first", "go mod download", "--rm x", "must start with a program name"},
+		{"relative cache", "/go/pkg/mod", "go/pkg/mod", "sandbox.cache"},
+		{"root cache", "/go/pkg/mod", "/", "sandbox.cache"},
+		{"workspace cache", "/go/pkg/mod", "/work", "is the workspace"},
+		{"tmp cache", "/go/pkg/mod", "/tmp/x", "sandbox.cache"},
+		{"git cache", "/go/pkg/mod", "/work/.git", "no ., .. or .git"},
+		{"dotdot cache", "/go/pkg/mod", "/go/../etc", "sandbox.cache"},
+		{"colon cache", "/go/pkg/mod", "/go:/etc", "sandbox.cache"},
+		{"comma cache", "/go/pkg/mod", "\"/go,ro=false\"", "sandbox.cache"},
+		{"twice", "/work/node_modules", "/go/pkg/mod", "listed twice"},
+		{"env name", "GOFLAGS:", "goflags:", "sandbox.env: name"},
+		{"env newline", "-mod=mod", "\"a\\nb\"", "must be on one line"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.Contains(sandbox, tt.old) {
+				t.Fatalf("fixture does not contain %q", tt.old)
+			}
+			_, err := project.Parse([]byte(valid+strings.Replace(sandbox, tt.old, tt.new, 1)), pack)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseNoPack(t *testing.T) {
 	old := strings.Replace(valid, "skills_version: 0.1.0", "skills_version: 0.0.9", 1)
 	if _, err := project.Parse([]byte(old), pack); err == nil {

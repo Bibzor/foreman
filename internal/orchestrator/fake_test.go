@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"github.com/Bibzor/foreman/internal/develop"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/qualify"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/workspace"
 )
 
@@ -555,6 +558,85 @@ func (p *fakeProbe) probe(_ context.Context, url string) (int, error) {
 
 func (w *fakeWorkspace) Snapshot(context.Context, config.Repo, int, string, string) (string, string, error) {
 	return "", "", errNoGit
+}
+
+func (w *fakeWorkspace) Checkout(context.Context, config.Repo, int, string, string) (string, error) {
+	return "", errNoGit
+}
+
+// fakeSandbox stands for the Docker sandbox. Exec runs the command on the
+// host, in the spec's workspace, so `true` and `false` mean what they say;
+// it records every call as "setup <workspace>", "exec <name> <workspace>"
+// and "cleanup".
+type fakeSandbox struct {
+	mu        sync.Mutex
+	events    []string
+	specs     []sandbox.Spec
+	failSetup int // the next failSetup setups fail
+}
+
+func (s *fakeSandbox) record(e string, spec sandbox.Spec) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, e)
+	s.specs = append(s.specs, spec)
+}
+
+func (s *fakeSandbox) Setup(_ context.Context, spec sandbox.Spec, out io.Writer) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	s.record("setup "+spec.Workspace, spec)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failSetup > 0 {
+		s.failSetup--
+		_, _ = io.WriteString(out, "go: downloading example.com/x: connection refused")
+		return &sandbox.ExitError{Code: 1}
+	}
+	return nil
+}
+
+func (s *fakeSandbox) Exec(ctx context.Context, spec sandbox.Spec, name string, out io.Writer) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	s.record("exec "+name+" "+spec.Workspace, spec)
+	c, ok := spec.Command(name)
+	if !ok {
+		return fmt.Errorf("no command %s", name)
+	}
+	cmd := exec.CommandContext(ctx, c.Argv[0], c.Argv[1:]...)
+	cmd.Dir = spec.Workspace
+	cmd.Stdout, cmd.Stderr = out, out
+	var ee *exec.ExitError
+	if err := cmd.Run(); errors.As(err, &ee) {
+		return &sandbox.ExitError{Code: ee.ExitCode()}
+	} else if err != nil {
+		return &sandbox.ExitError{Code: 127}
+	}
+	return nil
+}
+
+func (s *fakeSandbox) Cleanup(context.Context, config.Repo, int) error {
+	s.record("cleanup", sandbox.Spec{})
+	return nil
+}
+
+// kinds lists the events without their workspace.
+func (s *fakeSandbox) kinds() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, e := range s.events {
+		f := strings.Fields(e)
+		if f[0] == "exec" {
+			out = append(out, f[0]+" "+f[1])
+		} else {
+			out = append(out, f[0])
+		}
+	}
+	return out
 }
 
 func (w *fakeWorkspace) Push(context.Context, config.Repo, string, string, string, bool) error {

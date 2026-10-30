@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Bibzor/foreman/internal/config"
+	"github.com/Bibzor/foreman/internal/gitenv"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/skillpack"
 	"github.com/Bibzor/foreman/skills"
@@ -345,7 +347,7 @@ func TestSnapshotLeavesTheAgentsGitBehind(t *testing.T) {
 }
 
 // fakeGit puts a git wrapper first in PATH that records its arguments and
-// whether it saw the auth header in its environment, then runs git.
+// its GIT_* environment, then runs git.
 func fakeGit(t *testing.T) (log string) {
 	t.Helper()
 	gitPath, err := exec.LookPath("git")
@@ -356,7 +358,7 @@ func fakeGit(t *testing.T) (log string) {
 	log = filepath.Join(t.TempDir(), "git.log")
 	script := "#!/bin/sh\n" +
 		"echo \"ARGS $*\" >> " + log + "\n" +
-		"env | grep '^GIT_CONFIG_VALUE_0=' | sed 's/^/ENV /' >> " + log + "\n" +
+		"env | grep '^GIT_' | sed 's/^/ENV /' >> " + log + "\n" +
 		"exec " + gitPath + " \"$@\"\n"
 	write(t, bin, "git", script)
 	if err := os.Chmod(filepath.Join(bin, "git"), 0o700); err != nil {
@@ -398,7 +400,7 @@ func TestPushTokenOnlyInEnv(t *testing.T) {
 				t.Errorf("credential on the command line: %s", line)
 			}
 		}
-		if strings.HasPrefix(line, "ENV GIT_CONFIG_VALUE_0=Authorization: Basic ") {
+		if strings.HasPrefix(line, "ENV GIT_CONFIG_VALUE_") && strings.Contains(line, "=Authorization: Basic ") {
 			sawHeader = true
 		}
 	}
@@ -410,6 +412,112 @@ func TestPushTokenOnlyInEnv(t *testing.T) {
 		if err := scanForSecrets(root, []string{testToken, basic}); err != nil {
 			t.Errorf("%s: %v", root, err)
 		}
+	}
+}
+
+// gitCalls splits a fakeGit log into one environment per git call, keyed
+// by its arguments.
+func gitCalls(t *testing.T, log string) (args []string, envs [][]string) {
+	t.Helper()
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		switch {
+		case strings.HasPrefix(line, "ARGS "):
+			args = append(args, strings.TrimPrefix(line, "ARGS "))
+			envs = append(envs, nil)
+		case strings.HasPrefix(line, "ENV ") && len(envs) > 0:
+			envs[len(envs)-1] = append(envs[len(envs)-1], strings.TrimPrefix(line, "ENV "))
+		}
+	}
+	return args, envs
+}
+
+func TestEveryGitCallGetsTheForcedOptions(t *testing.T) {
+	bare := upstream(t)
+	base, _ := pushBranch(t, bare)
+	w := newWorkspace(t, bare)
+	log := fakeGit(t)
+	ctx := context.Background()
+	d, err := w.PrepareDev(ctx, repoID, 7, "foreman/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit(t, d.Workdir, "test: a", map[string]string{"x_test.go": "package x\n"})
+	dir, tip, err := w.Snapshot(ctx, repoID, 7, d.Workdir, "foreman/8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Push(ctx, repoID, dir, tip, "foreman/8", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.PrepareBranch(ctx, repoID, 7, "foreman/7", 3, base); err != nil {
+		t.Fatal(err)
+	}
+
+	args, envs := gitCalls(t, log)
+	foreman := 0
+	for i, env := range envs {
+		if slices.Contains(env, "GIT_AUTHOR_NAME=t") || strings.Contains(args[i], "user.name=t") {
+			continue // the test's own git, standing in for the agent
+		}
+		foreman++
+		for _, want := range append([]string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull}, forcedPairs()...) {
+			if !slices.Contains(env, want) {
+				t.Errorf("git %s: no %s in %q", args[i], want, env)
+			}
+		}
+	}
+	if foreman < 10 {
+		t.Fatalf("only %d git calls by foreman recorded:\n%q", foreman, args)
+	}
+}
+
+// forcedPairs renders gitenv.Forced as they appear in the environment,
+// at the indexes Env gives them.
+func forcedPairs() []string {
+	var out []string
+	for _, kv := range gitenv.Env() {
+		if strings.HasPrefix(kv, "GIT_CONFIG_KEY_") || strings.HasPrefix(kv, "GIT_CONFIG_VALUE_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+func TestCheckoutIsTheDefaultBranchOutsideTheClone(t *testing.T) {
+	bare := upstream(t)
+	base, tip := pushBranch(t, bare)
+	w := newWorkspace(t, bare)
+	d, err := w.PrepareBranch(context.Background(), repoID, 7, "foreman/7", 3, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What setup could leave behind last time: a read-only directory.
+	stale := filepath.Join(w.DataDir, "setup", "Bibzor", "demo-api", "7", "mod")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stale, 0o500); err != nil { // like a Go module cache
+		t.Fatal(err)
+	}
+	dir, err := w.Checkout(context.Background(), repoID, 7, d.Workdir, d.ProjectSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != filepath.Join(w.DataDir, "setup", "Bibzor", "demo-api", "7") || strings.HasPrefix(dir, d.Workdir) {
+		t.Fatalf("dir = %s", dir)
+	}
+	if got := run(t, dir, "rev-parse", "HEAD"); got != d.ProjectSHA || got == tip {
+		t.Fatalf("HEAD = %s, want the default branch %s, not the branch %s", got, d.ProjectSHA, tip)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "a.go")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the branch's files are in the setup tree")
+	}
+	if got := run(t, d.Workdir, "rev-parse", "HEAD"); got != tip {
+		t.Errorf("the agent's clone moved: %s", got)
 	}
 }
 

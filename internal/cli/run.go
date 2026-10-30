@@ -16,6 +16,8 @@ import (
 	"github.com/Bibzor/foreman/internal/config"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/orchestrator"
+	"github.com/Bibzor/foreman/internal/sandbox"
+	sdocker "github.com/Bibzor/foreman/internal/sandbox/docker"
 	"github.com/Bibzor/foreman/internal/store"
 	"github.com/Bibzor/foreman/internal/version"
 	"github.com/Bibzor/foreman/internal/workspace"
@@ -47,6 +49,15 @@ func run(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Both go, unquoted, into the agent's permission rules and the docker
+	// mounts.
+	foreman, err := executable()
+	if err != nil {
+		return err
+	}
+	if err := sandbox.HostPath(cfg.DataDir); err != nil {
+		return fmt.Errorf("data_dir: %w", err)
+	}
 	db, err := store.Open(filepath.Join(cfg.DataDir, "foreman.db"))
 	if err != nil {
 		return err
@@ -69,8 +80,10 @@ func run(args []string, stderr io.Writer) error {
 		Developer: claudecode.Developer{
 			Claude:  &claudecode.Claude{},
 			GitName: "foreman", GitEmail: "foreman@users.noreply.github.com",
+			Foreman: foreman, DataDir: cfg.DataDir,
 		},
 		Deployer: &docker.Deployer{Runner: docker.Exec{}, Probe: docker.HTTPProbe},
+		Sandbox:  &sdocker.Sandbox{Runner: sdocker.Exec{}},
 		Log:      log,
 	})
 
@@ -78,7 +91,7 @@ func run(args []string, stderr io.Writer) error {
 	defer stop()
 	log.Info("foreman starting", "version", version.Version, "skills", skills.PackVersion, "repos", len(cfg.Repos),
 		"wip_limit", cfg.WIPLimit, "once", once)
-	log.Warn("project test and lint commands run code written by the agent on this host, as this user, without isolation")
+	log.Warn("the agent itself runs on this host, as this user; access to the Docker daemon, which runs the sandbox, is root-equivalent")
 	if !once {
 		return engine.Run(ctx)
 	}
@@ -89,4 +102,20 @@ func run(args []string, stderr io.Writer) error {
 		return fmt.Errorf("cycle: %w", err)
 	}
 	return nil
+}
+
+// executable is the absolute path of the running foreman binary, with
+// symlinks resolved: the agent runs the project commands through it.
+func executable() (string, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if p, err = filepath.EvalSymlinks(p); err != nil {
+		return "", err
+	}
+	if err := sandbox.HostPath(p); err != nil {
+		return "", fmt.Errorf("foreman binary: %w", err)
+	}
+	return p, nil
 }

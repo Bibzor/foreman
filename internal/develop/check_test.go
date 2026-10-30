@@ -3,14 +3,18 @@ package develop_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/Bibzor/foreman/internal/config"
 	"github.com/Bibzor/foreman/internal/develop"
-	"github.com/Bibzor/foreman/internal/project"
+	"github.com/Bibzor/foreman/internal/sandbox"
 )
 
 func git(t *testing.T, dir string, args ...string) string {
@@ -220,37 +224,47 @@ func TestCheckHistorySecondRevision(t *testing.T) {
 	}
 }
 
-func commandProject(t *testing.T, test, lint string) project.Config {
-	t.Helper()
-	p := testProject(t)
-	p.Test = project.Command{Raw: test, Argv: strings.Fields(test)}
-	p.Lint = project.Command{Raw: lint, Argv: strings.Fields(lint)}
-	return p
+// fakeSandbox answers Exec with errs[name], writing "output of <name>".
+type fakeSandbox struct {
+	errs  map[string]error
+	execs []string
+}
+
+func (f *fakeSandbox) Setup(context.Context, sandbox.Spec, io.Writer) error { return nil }
+
+func (f *fakeSandbox) Exec(_ context.Context, s sandbox.Spec, name string, out io.Writer) error {
+	f.execs = append(f.execs, s.Workspace+":"+name)
+	_, _ = io.WriteString(out, "output of "+name)
+	return f.errs[name]
+}
+
+func (f *fakeSandbox) Cleanup(context.Context, config.Repo, int) error { return nil }
+
+func commandSpec() sandbox.Spec {
+	return sandbox.Spec{Workspace: "/data/check/o/r/7", TimeoutS: 900, Commands: []sandbox.Command{
+		{Name: "test", Argv: []string{"make", "test"}}, {Name: "lint", Argv: []string{"make", "lint"}},
+	}}
 }
 
 func TestRunCommands(t *testing.T) {
-	dir := t.TempDir()
-	if err := develop.RunCommands(context.Background(), dir, commandProject(t, "true", "true")); err != nil {
+	ctx := context.Background()
+	sb := &fakeSandbox{}
+	if err := develop.RunCommands(ctx, sb, commandSpec()); err != nil {
 		t.Fatal(err)
 	}
-	checkErr(t, develop.RunCommands(context.Background(), dir, commandProject(t, "false", "true")), develop.CheckTest, "`false`")
-	checkErr(t, develop.RunCommands(context.Background(), dir, commandProject(t, "true", "false")), develop.CheckLint, "`false`")
-	checkErr(t, develop.RunCommands(context.Background(), dir, commandProject(t, "no-such-binary-xyz", "true")), develop.CheckTest, "")
-}
-
-// The commands see no credential from foreman's environment.
-func TestRunCommandsEnvironment(t *testing.T) {
-	t.Setenv("GITHUB_TOKEN", "ghs_secret")
-	t.Setenv("ANTHROPIC_API_KEY", "sk-secret")
-	dir := t.TempDir()
-	// printenv fails when the variable is not set.
-	for _, name := range []string{"GITHUB_TOKEN", "ANTHROPIC_API_KEY"} {
-		p := commandProject(t, "printenv "+name, "true")
-		if err := develop.RunCommands(context.Background(), dir, p); err == nil {
-			t.Errorf("%s reached the command", name)
-		}
+	if !slices.Equal(sb.execs, []string{"/data/check/o/r/7:test", "/data/check/o/r/7:lint"}) {
+		t.Fatalf("execs = %q", sb.execs)
 	}
-	if err := develop.RunCommands(context.Background(), dir, commandProject(t, "printenv PATH", "true")); err != nil {
-		t.Errorf("PATH did not reach the command: %v", err)
+	checkErr(t, develop.RunCommands(ctx, &fakeSandbox{errs: map[string]error{"test": &sandbox.ExitError{Code: 2}}}, commandSpec()),
+		develop.CheckTest, "`make test`: exit status 2\noutput of test")
+	checkErr(t, develop.RunCommands(ctx, &fakeSandbox{errs: map[string]error{"lint": &sandbox.ExitError{Code: 1}}}, commandSpec()),
+		develop.CheckLint, "`make lint`: exit status 1")
+	checkErr(t, develop.RunCommands(ctx, &fakeSandbox{errs: map[string]error{"test": fmt.Errorf("%w after 15m0s", sandbox.ErrTimeout)}}, commandSpec()),
+		develop.CheckTest, "`make test` timed out after 15m0s")
+	// A sandbox that cannot run is not the agent's failure.
+	err := develop.RunCommands(ctx, &fakeSandbox{errs: map[string]error{"test": errors.New("docker run: no such image")}}, commandSpec())
+	var ce *develop.CheckError
+	if err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), "no such image") {
+		t.Fatalf("err = %v", err)
 	}
 }

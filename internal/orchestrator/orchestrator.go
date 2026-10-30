@@ -21,6 +21,7 @@ import (
 	"github.com/Bibzor/foreman/internal/develop"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/qualify"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/store"
 	"github.com/Bibzor/foreman/internal/workspace"
 )
@@ -65,6 +66,7 @@ type Workspace interface {
 	PrepareAt(ctx context.Context, repo config.Repo, number int, sha string) (workspace.Dirs, error)
 	PrepareBranch(ctx context.Context, repo config.Repo, number int, branch string, depth int, need string) (workspace.Dirs, error)
 	Snapshot(ctx context.Context, repo config.Repo, number int, workdir, branch string) (dir, tip string, err error)
+	Checkout(ctx context.Context, repo config.Repo, number int, workdir, sha string) (string, error)
 	Push(ctx context.Context, repo config.Repo, dir, sha, branch string, force bool) error
 }
 
@@ -103,8 +105,11 @@ type Deps struct {
 	Agent     qualify.Agent
 	Developer develop.Agent
 	Deployer  acceptance.Deployer
-	Log       *slog.Logger
-	Now       func() time.Time
+	// Sandbox runs the project's commands: setup, and foreman's own test
+	// and lint check.
+	Sandbox sandbox.Sandbox
+	Log     *slog.Logger
+	Now     func() time.Time
 }
 
 // Engine runs the state machine.

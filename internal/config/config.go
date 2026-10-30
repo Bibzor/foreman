@@ -65,6 +65,15 @@ var (
 	loginRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
 )
 
+// ParseRepo parses owner/name.
+func ParseRepo(s string) (Repo, error) {
+	owner, name, ok := strings.Cut(s, "/")
+	if !ok || !ownerRe.MatchString(owner) || !nameRe.MatchString(name) || name == "." || name == ".." {
+		return Repo{}, fmt.Errorf("%q is not owner/name", s)
+	}
+	return Repo{Owner: owner, Name: name}, nil
+}
+
 // DefaultPath returns the default configuration path, with ~ expanded.
 func DefaultPath() (string, error) { return expandHome(defaultPath) }
 
@@ -103,9 +112,9 @@ func Parse(b []byte) (Config, error) {
 	}
 	seen := make(map[string]bool)
 	for _, r := range f.Repos {
-		owner, name, ok := strings.Cut(r, "/")
-		if !ok || !ownerRe.MatchString(owner) || !nameRe.MatchString(name) || name == "." || name == ".." {
-			errs = append(errs, fmt.Errorf("repos: %q is not owner/name", r))
+		repo, err := ParseRepo(r)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("repos: %w", err))
 			continue
 		}
 		key := strings.ToLower(r)
@@ -114,7 +123,7 @@ func Parse(b []byte) (Config, error) {
 			continue
 		}
 		seen[key] = true
-		c.Repos = append(c.Repos, Repo{Owner: owner, Name: name})
+		c.Repos = append(c.Repos, repo)
 	}
 	if len(f.AuthorizedUsers) == 0 {
 		errs = append(errs, errors.New("authorized_users is required"))

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -59,10 +60,29 @@ type Session struct {
 // loading a skill. Nothing writes, runs commands or reaches the network.
 var ReadOnlyTools = []string{"Read", "Grep", "Glob", "Skill"}
 
+// GitDenied are the rules that deny the file tools the clone's .git:
+// options in .git/config would make the agent's own git commands run
+// programs.
+func GitDenied(dir string) []string {
+	dirs := []string{dir}
+	// The same directory as Claude Code may see it, symlinks resolved.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil && resolved != dir {
+		dirs = append(dirs, resolved)
+	}
+	var out []string
+	for _, tool := range []string{"Read", "Edit", "Write"} {
+		for _, d := range dirs {
+			// "//" starts an absolute path in a Claude Code rule.
+			out = append(out, tool+"(/"+d+"/.git)", tool+"(/"+d+"/.git/**)")
+		}
+	}
+	return out
+}
+
 // Args returns the claude command line for s. The prompt is sent on
 // stdin, so issue text never appears in the process list.
 // Each permission rule is its own argument, so a rule containing a space
-// cannot be split.
+// cannot be split. The file tools are always denied the clone's .git.
 func (c *Claude) Args(s Session) []string {
 	allowed := s.Allowed
 	if allowed == nil {
@@ -75,6 +95,8 @@ func (c *Claude) Args(s Session) []string {
 		"--allowedTools",
 	}
 	args = append(args, allowed...)
+	args = append(args, "--disallowedTools")
+	args = append(args, GitDenied(s.Dir)...)
 	return append(args,
 		"--permission-mode", "dontAsk",
 		"--restricted",

@@ -65,6 +65,27 @@ type Request struct {
 	// Feedback is set when a previous implementation was merged and
 	// rejected at acceptance: this development addresses it.
 	Feedback *Feedback
+	// SandboxSpec is the spec of the agent's sandbox, outside the clone.
+	SandboxSpec string
+	// Commands are the command lines that run the project commands in the
+	// sandbox. The agent implementation fills them: they name its binary.
+	Commands []AgentCommand
+}
+
+// AgentCommand is a project command as the agent runs it.
+type AgentCommand struct {
+	Line string // the command line the agent may run
+	Runs string // the project command it runs in the sandbox
+}
+
+// GitCommands are the git commands the agent may run, as prefixes: no
+// pager and no external diff, whatever .git/config says.
+var GitCommands = []string{
+	"git --no-pager status",
+	"git --no-pager diff --no-ext-diff",
+	"git --no-pager log --no-ext-diff",
+	"git --no-pager add",
+	"git --no-pager commit",
 }
 
 // Feedback is the comment explaining why a merged change was rejected at

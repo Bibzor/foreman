@@ -45,6 +45,8 @@ type fixture struct {
 	// checks under the real Docker deployer.
 	docker *fakeDocker
 	probe  *fakeProbe
+	// sandbox stands for the Docker sandbox.
+	sandbox *fakeSandbox
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -60,7 +62,7 @@ func newFixture(t *testing.T) *fixture {
 		return clock
 	}
 	fx := &fixture{t: t, dir: t.TempDir(), gh: newFakeGitHub(now), agent: &fakeAgent{}, now: now,
-		docker: &fakeDocker{}, probe: &fakeProbe{status: 200}}
+		docker: &fakeDocker{}, probe: &fakeProbe{status: 200}, sandbox: &fakeSandbox{}}
 	fx.ws = &fakeWorkspace{dir: fx.dir}
 	fx.restart()
 	if err := fx.engine.Start(context.Background()); err != nil {
@@ -98,7 +100,8 @@ func (fx *fixture) restart() {
 		Developer: fx.agent,
 		Deployer: &docker.Deployer{Runner: fx.docker, Probe: fx.probe.probe,
 			SmokeTimeout: 50 * time.Millisecond, Interval: time.Millisecond},
-		Now: func() time.Time { return fx.now().Add(fx.skew) },
+		Sandbox: fx.sandbox,
+		Now:     func() time.Time { return fx.now().Add(fx.skew) },
 	})
 	if fx.workspace == nil {
 		// Qualification tests stop at queued.

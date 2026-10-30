@@ -35,6 +35,21 @@ type Config struct {
 	// Acceptance is the acceptance environment, nil when the project has
 	// none.
 	Acceptance *Acceptance
+	// Sandbox is the container the project commands run in. It is
+	// required to develop, nil when the section is missing.
+	Sandbox *Sandbox
+}
+
+// Sandbox is the container image and setup the project commands run in.
+type Sandbox struct {
+	Image string // name:tag or name@sha256:digest, never latest
+	// Setup runs with network access, before the agent, on the default
+	// branch: it fills the caches.
+	Setup []Command
+	// Cache are the container paths that persist from setup to the
+	// commands, read-only for the commands.
+	Cache []string
+	Env   map[string]string
 }
 
 // Acceptance is the acceptance environment foreman deploys a merged
@@ -90,6 +105,12 @@ type file struct {
 			Status int    `yaml:"status"`
 		} `yaml:"smoke"`
 	} `yaml:"acceptance"`
+	Sandbox *struct {
+		Image string            `yaml:"image"`
+		Setup []string          `yaml:"setup"`
+		Cache []string          `yaml:"cache"`
+		Env   map[string]string `yaml:"env"`
+	} `yaml:"sandbox"`
 }
 
 // ErrMissing means the repository has no .foreman.yml.
@@ -207,6 +228,11 @@ func parse(b []byte, packVersion string, checkPack bool) (Config, error) {
 		}
 		c.Acceptance = acc
 	}
+	if f.Sandbox != nil {
+		sb, err := parseSandbox(f.Sandbox.Image, f.Sandbox.Setup, f.Sandbox.Cache, f.Sandbox.Env)
+		errs = append(errs, err)
+		c.Sandbox = sb
+	}
 	if err := errors.Join(errs...); err != nil {
 		return Config{}, fmt.Errorf("invalid %s: %w", File, err)
 	}
@@ -233,6 +259,29 @@ func parseCommand(field, raw string) (Command, error) {
 	return Command{Raw: strings.Join(clean, " "), Argv: clean}, nil
 }
 
+// ValidArgv checks argv like a command of .foreman.yml: plain words, a
+// program first.
+func ValidArgv(argv []string) error {
+	if len(argv) == 0 {
+		return errors.New("empty command")
+	}
+	for _, w := range argv {
+		if !word.MatchString(w) {
+			return fmt.Errorf("%q: only letters, digits and _./:=@%%+,- are allowed in a command", w)
+		}
+	}
+	if strings.HasPrefix(argv[0], "-") {
+		return fmt.Errorf("%q must start with a program name", strings.Join(argv, " "))
+	}
+	return nil
+}
+
+// ValidEnv checks environment variables like those of .foreman.yml.
+func ValidEnv(field string, m map[string]string) error {
+	_, err := variables(field, m)
+	return err
+}
+
 // protectedPath accepts "dir/" (a prefix) or an exact relative path.
 func protectedPath(p string) (string, error) {
 	dir := strings.HasSuffix(p, "/")
@@ -248,6 +297,89 @@ func protectedPath(p string) (string, error) {
 		return clean + "/", nil
 	}
 	return clean, nil
+}
+
+const (
+	maxSetup = 10
+	maxCache = 8
+)
+
+// image is a docker image reference with a tag or a digest:
+// [registry[:port]/]name[/name...](:tag|@sha256:digest).
+var image = regexp.MustCompile(`^([a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?/)?[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*` +
+	`(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}|@sha256:[0-9a-f]{64})$`)
+
+// cachePath is an absolute container path made of plain words.
+var cachePath = regexp.MustCompile(`^(/[A-Za-z0-9_.@+-]+)+$`)
+
+// ImageRef validates a docker image reference pinned by a tag other than
+// latest, or by a digest.
+func ImageRef(ref string) error {
+	if !image.MatchString(ref) {
+		return fmt.Errorf("%q must be an image name with a tag or a sha256 digest", ref)
+	}
+	if strings.HasSuffix(ref, ":latest") {
+		return fmt.Errorf("%q: pin a version, not latest", ref)
+	}
+	return nil
+}
+
+func parseSandbox(img string, setup, cache []string, env map[string]string) (*Sandbox, error) {
+	sb := &Sandbox{Image: img}
+	var errs []error
+	if err := ImageRef(img); err != nil {
+		errs = append(errs, fmt.Errorf("sandbox.image: %w", err))
+	}
+	if len(setup) > maxSetup {
+		errs = append(errs, fmt.Errorf("sandbox.setup: at most %d commands", maxSetup))
+	}
+	for i, raw := range setup {
+		cmd, err := parseCommand(fmt.Sprintf("sandbox.setup[%d]", i), raw)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		sb.Setup = append(sb.Setup, cmd)
+	}
+	if len(cache) > maxCache {
+		errs = append(errs, fmt.Errorf("sandbox.cache: at most %d paths", maxCache))
+	}
+	seen := map[string]bool{}
+	for _, p := range cache {
+		if err := CachePath(p); err != nil {
+			errs = append(errs, fmt.Errorf("sandbox.cache: %w", err))
+			continue
+		}
+		if seen[p] {
+			errs = append(errs, fmt.Errorf("sandbox.cache: %q is listed twice", p))
+			continue
+		}
+		seen[p] = true
+		sb.Cache = append(sb.Cache, p)
+	}
+	var err error
+	if sb.Env, err = variables("sandbox.env", env); err != nil {
+		errs = append(errs, err)
+	}
+	return sb, errors.Join(errs...)
+}
+
+// CachePath validates a cache path: absolute and clean, inside neither
+// /tmp nor .git, and none of /, /work and /tmp themselves. A path under
+// /work, such as /work/node_modules, is mounted over the workspace.
+func CachePath(p string) error {
+	if !cachePath.MatchString(p) || path.Clean(p) != p {
+		return fmt.Errorf("%q must be a clean absolute path of letters, digits and _.@+-", p)
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." || seg == ".git" {
+			return fmt.Errorf("%q: no ., .. or .git", p)
+		}
+	}
+	if p == "/work" || p == "/tmp" || strings.HasPrefix(p, "/tmp/") {
+		return fmt.Errorf("%q is the workspace or /tmp, not a cache", p)
+	}
+	return nil
 }
 
 const maxSmoke = 10

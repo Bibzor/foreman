@@ -33,8 +33,10 @@ import (
 	"strings"
 
 	"github.com/Bibzor/foreman/internal/config"
+	"github.com/Bibzor/foreman/internal/gitenv"
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/project"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/skillpack"
 )
 
@@ -209,6 +211,29 @@ func (w *Workspace) Snapshot(ctx context.Context, repo config.Repo, number int, 
 	return dir, tip, err
 }
 
+// Checkout clones workdir into data_dir/setup/<owner>/<repo>/<issue>, a
+// directory foreman owns, with commit sha checked out, detached: the tree
+// the sandbox setup runs on, so that setup never touches the agent's
+// clone. Call it before the agent runs in workdir.
+func (w *Workspace) Checkout(ctx context.Context, repo config.Repo, number int, workdir, sha string) (string, error) {
+	dir := filepath.Join(w.DataDir, "setup", repo.Owner, repo.Name, strconv.Itoa(number))
+	// A previous setup may have left read-only directories.
+	if err := sandbox.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return "", err
+	}
+	if _, err := Git(ctx, "", "clone", "-q", "--no-local", "--no-tags", "--no-checkout", "--", workdir, dir); err != nil {
+		_ = sandbox.RemoveAll(dir)
+		return "", err
+	}
+	if _, err := Git(ctx, dir, "checkout", "-q", "--detach", sha); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // Push pushes commit sha of the repository in dir to branch on GitHub.
 // The token reaches the git process through its environment only, and
 // the URL is given on the command line: no remote is stored. force
@@ -236,21 +261,19 @@ func (w *Workspace) cloneURL(repo config.Repo) string {
 	return "https://github.com/" + repo.Owner + "/" + repo.Name + ".git"
 }
 
-// auth returns the environment that gives a git process the installation
-// token as an HTTP header, and the strings to redact and scan for.
-func (w *Workspace) auth(ctx context.Context, repo config.Repo) (env, secrets []string, err error) {
+// auth returns the configuration that gives a git process the
+// installation token as an HTTP header, and the strings to redact and
+// scan for.
+func (w *Workspace) auth(ctx context.Context, repo config.Repo) (cfg []gitenv.Pair, secrets []string, err error) {
 	tok, err := w.Tokens.Token(ctx, repo)
 	if err != nil {
 		return nil, nil, err
 	}
 	basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + tok.Reveal()))
 	// The header lives only in the git process's environment.
-	return []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=http.extraHeader",
-		"GIT_CONFIG_VALUE_0=Authorization: Basic " + basic,
-		"GIT_CONFIG_KEY_1=credential.helper",
-		"GIT_CONFIG_VALUE_1=",
+	return []gitenv.Pair{
+		{Key: "http.extraHeader", Value: "Authorization: Basic " + basic},
+		{Key: "credential.helper", Value: ""},
 	}, []string{tok.Reveal(), basic}, nil
 }
 
@@ -293,31 +316,30 @@ func Git(ctx context.Context, dir string, args ...string) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
-func git(ctx context.Context, dir string, extraEnv, secrets []string, args ...string) error {
-	_, err := gitOut(ctx, dir, extraEnv, secrets, args...)
+func git(ctx context.Context, dir string, extra []gitenv.Pair, secrets []string, args ...string) error {
+	_, err := gitOut(ctx, dir, extra, secrets, args...)
 	return err
 }
 
 // gitOut runs git with a clean configuration: no system or global config,
-// no prompt, no hooks. extraEnv carries per-call settings; secrets are
-// redacted from its error output.
-func gitOut(ctx context.Context, dir string, extraEnv, secrets []string, args ...string) (string, error) {
+// no prompt, the gitenv.Forced options over whatever .git/config says.
+// extra carries per-call options; secrets are redacted from its error
+// output.
+func gitOut(ctx context.Context, dir string, extra []gitenv.Pair, secrets []string, args ...string) (string, error) {
 	sub := args[0]
 	// No background gc or maintenance: it would write in .git while
 	// scanForSecrets reads it.
-	args = append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)
+	extra = append([]gitenv.Pair{{Key: "gc.auto", Value: "0"}, {Key: "maintenance.auto", Value: "false"}}, extra...)
 	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // fixed binary; args are built here, the URL from validated config
 	cmd.Dir = dir
 	cmd.Env = append([]string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
-		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=" + os.DevNull,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",
 		"SSH_ASKPASS=",
 		"LC_ALL=C",
-	}, extraEnv...)
+	}, gitenv.Env(extra...)...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

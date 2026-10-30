@@ -64,6 +64,10 @@ func TestQualifyCommandLineAndEnv(t *testing.T) {
 	}
 	want := []string{
 		"-p", "--output-format", "json", "--tools", "Read,Grep,Glob,Skill", "--allowedTools", "Read", "Grep", "Glob", "Skill",
+		"--disallowedTools",
+		"Read(//data/work/o/r/1/.git)", "Read(//data/work/o/r/1/.git/**)",
+		"Edit(//data/work/o/r/1/.git)", "Edit(//data/work/o/r/1/.git/**)",
+		"Write(//data/work/o/r/1/.git)", "Write(//data/work/o/r/1/.git/**)",
 		"--permission-mode", "dontAsk", "--restricted", "--strict-mcp-config", "--no-session-persistence",
 		"--max-turns", "12", "--plugin-dir", "/data/skills/o/r/1",
 	}

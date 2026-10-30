@@ -16,6 +16,7 @@ import (
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/orchestrator"
 	"github.com/Bibzor/foreman/internal/qualify"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/store"
 	"github.com/Bibzor/foreman/internal/workspace"
 	"github.com/Bibzor/foreman/skills"
@@ -100,6 +101,7 @@ commands: {test: %s, lint: %s}
 protected_paths: [.github/workflows/, AGENTS.md, .foreman.yml, go.mod]
 test_paths: ["**/*_test.go"]
 max_diff_lines: 50
+sandbox: {image: "golang:1.27", setup: [go mod download], cache: [/go/pkg/mod]}
 `
 
 type devSetup struct {
@@ -444,6 +446,108 @@ func TestProjectFileProblemsBlock(t *testing.T) {
 				t.Fatal("the agent ran without a valid project configuration")
 			}
 		})
+	}
+}
+
+func TestDevelopmentRunsCommandsOnlyInTheSandbox(t *testing.T) {
+	fx := newDevFixture(t)
+	specPath := filepath.Join(fx.dir, "skills", "Bibzor", "demo-api", "7", "sandbox.json")
+	// What the agent finds when it runs: setup done, its spec in place.
+	var s sandbox.Spec
+	var sbAtDevelop []string
+	var specErr error
+	fx.agent.pushDev(devAnswer{work: func(dir string) {
+		sbAtDevelop = fx.sandbox.kinds()
+		s, specErr = sandbox.Read(specPath, fx.dir)
+		goodWork(t)(dir)
+	}, res: done()})
+	fx.agent.pushPre(lowFindings())
+	fx.approve()
+	if s := fx.state(); s != store.InReview {
+		t.Fatalf("state = %q; comments:\n%s", s, strings.Join(fx.gh.botComments(), "\n---\n"))
+	}
+	// Setup, then the agent, then the cleanup of what it left, then
+	// foreman's own check.
+	if !slices.Equal(sbAtDevelop, []string{"setup"}) {
+		t.Fatalf("sandbox calls before the agent = %q", sbAtDevelop)
+	}
+	if got := fx.sandbox.kinds(); !slices.Equal(got, []string{"setup", "cleanup", "exec test", "exec lint"}) {
+		t.Fatalf("sandbox calls = %q", got)
+	}
+	work := filepath.Join(fx.dir, "work", "Bibzor", "demo-api", "7")
+	setupTree := filepath.Join(fx.dir, "setup", "Bibzor", "demo-api", "7")
+	check := filepath.Join(fx.dir, "check", "Bibzor", "demo-api", "7")
+	setup, test := fx.sandbox.specs[0], fx.sandbox.specs[2]
+	// Setup runs on a copy of the default branch, never on the agent's
+	// clone, and the copy is gone afterwards.
+	if setup.Workspace != setupTree || !slices.Equal(setup.Commands[0].Argv, []string{"go", "mod", "download"}) {
+		t.Errorf("setup = %+v", setup)
+	}
+	if _, err := os.Stat(setupTree); !os.IsNotExist(err) {
+		t.Errorf("setup tree left behind: %v", err)
+	}
+	// The check runs in foreman's clone, with the setup's caches.
+	if test.Workspace != check || test.Timeout() != sandbox.CheckTimeout || len(test.Caches) != 1 ||
+		test.Caches[0].Host != setup.Caches[0].Host || test.Caches[0].Container != "/go/pkg/mod" {
+		t.Errorf("check spec = %+v", test)
+	}
+	// The agent got a spec outside its clone, for its own workspace.
+	req := fx.agent.devReqs[0]
+	if req.SandboxSpec != specPath || strings.HasPrefix(req.SandboxSpec, work+"/") {
+		t.Fatalf("spec = %q", req.SandboxSpec)
+	}
+	if specErr != nil {
+		t.Fatal(specErr)
+	}
+	if s.Workspace != work || s.Timeout() != sandbox.AgentTimeout || s.Image != "golang:1.27" {
+		t.Errorf("agent spec = %+v", s)
+	}
+}
+
+func TestNoSandboxSectionBlocks(t *testing.T) {
+	noSandbox, _, found := strings.Cut(fmt.Sprintf(defaultProject, skills.PackVersion, "true", "true"), "sandbox:")
+	if !found {
+		t.Fatal("defaultProject has no sandbox section")
+	}
+	fx := newDevFixture(t, func(s *devSetup) { s.projectFile = &noSandbox })
+	fx.approve()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	last := fx.lastComment()
+	for _, want := range []string{"**Blocked: `.foreman.yml` on `main` has no `sandbox` section.**", "image: golang:1.27"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("comment lacks %q:\n%s", want, last)
+		}
+	}
+	if fx.agent.devCalls() != 0 || len(fx.sandbox.kinds()) != 0 {
+		t.Fatal("the agent or the sandbox ran without a sandbox section")
+	}
+}
+
+func TestSetupFailureIsRetriedThenBlocks(t *testing.T) {
+	fx := newDevFixture(t)
+	fx.sandbox.failSetup = orchestrator.MaxPrepFailures
+	fx.toAwaitingGo()
+	fx.gh.label("go", owner)
+	for i := 1; i < orchestrator.MaxPrepFailures; i++ {
+		if err := fx.engine.Tick(context.Background()); err == nil {
+			t.Fatalf("tick %d: a failed setup was not reported", i)
+		}
+		if s := fx.state(); s != store.InProgress {
+			t.Fatalf("tick %d: state = %q", i, s)
+		}
+	}
+	fx.tick()
+	if s := fx.state(); s != store.Blocked {
+		t.Fatalf("state = %q", s)
+	}
+	if last := fx.lastComment(); !strings.Contains(last, "could not prepare the sandbox 5 times in a row") ||
+		!strings.Contains(last, "connection refused") {
+		t.Fatalf("comment = %q", last)
+	}
+	if fx.agent.devCalls() != 0 {
+		t.Fatal("the agent ran without its sandbox")
 	}
 }
 

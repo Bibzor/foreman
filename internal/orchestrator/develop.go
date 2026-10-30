@@ -12,6 +12,7 @@ import (
 	"github.com/Bibzor/foreman/internal/github"
 	"github.com/Bibzor/foreman/internal/project"
 	"github.com/Bibzor/foreman/internal/qualify"
+	"github.com/Bibzor/foreman/internal/sandbox"
 	"github.com/Bibzor/foreman/internal/store"
 	"github.com/Bibzor/foreman/internal/workspace"
 	"github.com/Bibzor/foreman/skills"
@@ -131,9 +132,13 @@ func (e *Engine) inProgress(ctx context.Context, c *Case) (*Transition, error) {
 	if t != nil {
 		return t, nil
 	}
+	spec, t, err := e.prepareSandbox(ctx, c, dirs, p)
+	if t != nil || err != nil {
+		return t, err
+	}
 	req := develop.Request{
 		Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Branch: branch, Project: p,
-		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria,
+		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria, SandboxSpec: spec,
 	}
 	if c.Issue.AcceptanceRounds > 0 {
 		req.Feedback = &develop.Feedback{Author: c.Issue.AcceptanceFeedbackAuthor, Body: c.Issue.AcceptanceFeedback}
@@ -183,6 +188,7 @@ func (e *Engine) inProgress(ctx context.Context, c *Case) (*Transition, error) {
 // develop runs the agent, once more if its output is invalid, and turns
 // a failure into a blocking transition. what names the run in comments.
 func (e *Engine) develop(ctx context.Context, c *Case, req develop.Request, what string) (develop.Result, *Transition, error) {
+	defer e.cleanupSandbox(ctx, c)
 	res, err := e.Developer.Develop(ctx, req)
 	var inv *qualify.InvalidOutputError
 	if errors.As(err, &inv) {
@@ -234,7 +240,8 @@ func (e *Engine) verify(ctx context.Context, c *Case, workdir, branch string, p 
 	r.Tip = tip
 	changes, err = develop.CheckHistory(ctx, dir, p, r)
 	if err == nil {
-		err = develop.RunCommands(ctx, dir, p)
+		err = develop.RunCommands(ctx, e.Sandbox,
+			sandbox.New(p, e.Config.DataDir, c.Repo, c.Issue.Number, dir, sandbox.CheckTimeout))
 	}
 	var ce *develop.CheckError
 	switch {
@@ -341,7 +348,7 @@ func (e *Engine) preReview(ctx context.Context, c *Case, pr github.PullRequest) 
 	if _, t := projectConfig(dirs); t != nil {
 		return t, nil
 	}
-	diff, err := workspace.Git(ctx, dirs.Workdir, "diff", "--no-renames", c.Issue.BaseSHA, "HEAD")
+	diff, err := workspace.Git(ctx, dirs.Workdir, "diff", "--no-ext-diff", "--no-renames", c.Issue.BaseSHA, "HEAD")
 	if err != nil {
 		return nil, err
 	}
@@ -455,6 +462,10 @@ func (e *Engine) revise(ctx context.Context, c *Case, pr github.PullRequest, rv 
 	if t != nil {
 		return t, nil
 	}
+	spec, t, err := e.prepareSandbox(ctx, c, dirs, p)
+	if t != nil || err != nil {
+		return t, err
+	}
 	round := c.Issue.RevisionRounds + 1
 	what := fmt.Sprintf("revision %d of %d", round, MaxRevisions)
 	review := &develop.Review{Author: rv.Author, Body: rv.Body}
@@ -464,7 +475,7 @@ func (e *Engine) revise(ctx context.Context, c *Case, pr github.PullRequest, rv 
 	branch := Branch(c.Issue)
 	req := develop.Request{
 		Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Branch: branch, Project: p,
-		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria, Review: review,
+		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria, Review: review, SandboxSpec: spec,
 	}
 	res, t, err := e.develop(ctx, c, req, what)
 	if t != nil || err != nil {

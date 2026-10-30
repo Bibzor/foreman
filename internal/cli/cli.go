@@ -29,6 +29,7 @@ const usage = `Usage:
   foreman skills install [--agent claude] --target <repo>
   foreman skills verify --target <repo>
   foreman skills list
+  foreman sandbox exec --data-dir <dir> <test|lint|N>
   foreman version
 `
 
@@ -39,9 +40,12 @@ var errUsage = errors.New("usage")
 // process exit code.
 func Run(args []string, stdout, stderr io.Writer) int {
 	err := dispatch(args, stdout, stderr)
+	var code exitCode
 	switch {
 	case err == nil:
 		return exitOK
+	case errors.As(err, &code):
+		return int(code) // the sandboxed command said why already
 	case errors.Is(err, flag.ErrHelp):
 		return exitOK
 	case errors.Is(err, errUsage):
@@ -69,6 +73,11 @@ func dispatch(args []string, stdout, stderr io.Writer) error {
 		return err
 	case "run":
 		return run(args[1:], stderr)
+	case "sandbox":
+		if len(args) < 2 || args[1] != "exec" {
+			return fmt.Errorf("%w: unknown sandbox command", errUsage)
+		}
+		return sandboxExec(args[2:], stdout, stderr)
 	case "skills":
 		if len(args) < 2 {
 			return fmt.Errorf("%w: missing skills command", errUsage)

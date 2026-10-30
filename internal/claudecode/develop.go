@@ -2,12 +2,16 @@ package claudecode
 
 import (
 	"context"
-	"os"
+	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Bibzor/foreman/internal/develop"
+	"github.com/Bibzor/foreman/internal/gitenv"
 	"github.com/Bibzor/foreman/internal/project"
 	"github.com/Bibzor/foreman/internal/qualify"
+	"github.com/Bibzor/foreman/internal/sandbox"
 )
 
 // Limits of the development and pre-review runs.
@@ -19,18 +23,19 @@ const (
 )
 
 // DevTools returns the tools of a development run and the rules that
-// allow them. Files are read and written in the clone only; Bash runs
-// only the project's commands, verbatim, and the git commands that make
-// commits. Nothing pushes, calls gh or reaches the network on purpose:
-// the project commands, though, run code the agent wrote.
-func DevTools(p project.Config) (tools, allowed []string) {
+// allow them. Files are read and written in the clone only, never its
+// .git; Bash runs only the project's commands, in the sandbox through
+// `foreman sandbox exec`, and the git commands that make commits, with no
+// pager and no external diff. Nothing pushes, calls gh or reaches the
+// network on purpose.
+func DevTools(cmds []develop.AgentCommand) (tools, allowed []string) {
 	tools = []string{"Read", "Grep", "Glob", "Edit", "Write", "Skill", "Bash"}
 	allowed = []string{"Read", "Grep", "Glob", "Edit", "Write", "Skill"}
-	for _, c := range p.Commands() {
-		allowed = append(allowed, "Bash("+c.Raw+")")
+	for _, c := range cmds {
+		allowed = append(allowed, "Bash("+c.Line+")")
 	}
-	for _, g := range []string{"add", "commit", "status", "diff", "log"} {
-		allowed = append(allowed, "Bash(git "+g+":*)")
+	for _, g := range develop.GitCommands {
+		allowed = append(allowed, "Bash("+g+":*)")
 	}
 	return tools, allowed
 }
@@ -41,35 +46,63 @@ type Developer struct {
 	// GitName and GitEmail sign the agent's commits.
 	GitName  string
 	GitEmail string
+	// Foreman is the absolute path of the foreman binary and DataDir its
+	// data directory: the agent runs the project commands with
+	// `<Foreman> sandbox exec --data-dir <DataDir> <name>`.
+	Foreman string
+	DataDir string
 }
 
-// gitEnv is the git setup of a development run: an identity, and no
-// configuration but foreman's, so the agent's commits run no hook and
-// sign nothing whatever the local user's git configuration says.
-func (d Developer) gitEnv() []string {
-	return []string{
+// Commands returns the command lines that run the commands of p in the
+// sandbox.
+func (d Developer) Commands(p project.Config) []develop.AgentCommand {
+	var out []develop.AgentCommand
+	for _, c := range sandbox.Names(p) {
+		out = append(out, develop.AgentCommand{Line: sandbox.Line(d.Foreman, d.DataDir, c.Name), Runs: strings.Join(c.Argv, " ")})
+	}
+	return out
+}
+
+// env is the environment of a development run, over the allowlist: the
+// sandbox spec, a Bash timeout long enough for a test run, and git with
+// an identity and only foreman's configuration over .git/config, so the
+// agent's git runs no hook, pager, external diff or fsmonitor and signs
+// nothing.
+func (d Developer) env(spec string) []string {
+	ms := strconv.Itoa(int(sandbox.AgentTimeout / time.Millisecond))
+	env := []string{
+		sandbox.EnvSpec + "=" + spec,
+		"BASH_DEFAULT_TIMEOUT_MS=" + ms, "BASH_MAX_TIMEOUT_MS=" + ms,
 		"GIT_AUTHOR_NAME=" + d.GitName, "GIT_AUTHOR_EMAIL=" + d.GitEmail,
 		"GIT_COMMITTER_NAME=" + d.GitName, "GIT_COMMITTER_EMAIL=" + d.GitEmail,
-		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + os.DevNull,
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=" + os.DevNull,
-		"GIT_CONFIG_KEY_1=commit.gpgSign", "GIT_CONFIG_VALUE_1=false",
+	}
+	return append(env, gitenv.Env()...)
+}
+
+// DevSession is the session of a development or revision run: its tools,
+// rules and environment, with no prompt.
+func (d Developer) DevSession(req develop.Request) Session {
+	tools, allowed := DevTools(d.Commands(req.Project))
+	return Session{
+		Dir:       req.Workdir,
+		PluginDir: req.SkillsDir,
+		Tools:     tools,
+		Allowed:   allowed,
+		ExtraEnv:  d.env(req.SandboxSpec),
+		MaxTurns:  DevMaxTurns,
+		Timeout:   DevTimeout,
 	}
 }
 
 // Develop runs a development or revision and validates the output.
 func (d Developer) Develop(ctx context.Context, req develop.Request) (develop.Result, error) {
-	tools, allowed := DevTools(req.Project)
-	text, err := d.Claude.Exec(ctx, Session{
-		Dir:       req.Workdir,
-		PluginDir: req.SkillsDir,
-		Tools:     tools,
-		Allowed:   allowed,
-		ExtraEnv:  d.gitEnv(),
-		MaxTurns:  DevMaxTurns,
-		Timeout:   DevTimeout,
-		Prompt:    develop.Prompt(req),
-	})
+	if req.SandboxSpec == "" {
+		return develop.Result{}, errors.New("no sandbox spec: the project commands would have nowhere to run")
+	}
+	req.Commands = d.Commands(req.Project)
+	s := d.DevSession(req)
+	s.Prompt = develop.Prompt(req)
+	text, err := d.Claude.Exec(ctx, s)
 	if err != nil {
 		return develop.Result{}, err
 	}
