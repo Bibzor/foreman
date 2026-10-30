@@ -146,13 +146,6 @@ func (f *fakeGitHub) prLabels(num int) []string {
 	return slices.Clone(f.issues[key(repo, num)].Labels)
 }
 
-func (f *fakeGitHub) mergePR(num int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	p := f.prs[key(repo, num)]
-	p.Open, p.Merged = false, true
-}
-
 func (f *fakeGitHub) closePR(num int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -160,12 +153,26 @@ func (f *fakeGitHub) closePR(num int) {
 }
 
 func (f *fakeGitHub) review(num int, author, state, body string, comments ...github.ReviewComment) {
+	f.reviewAt(num, "", author, state, body, comments...)
+}
+
+// reviewAt is a review made on commit sha of the PR.
+func (f *fakeGitHub) reviewAt(num int, sha, author, state, body string, comments ...github.ReviewComment) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := f.prs[key(repo, num)]
 	id := f.id()
-	p.reviews = append(p.reviews, github.Review{ID: id, Author: author, State: state, Body: body, SubmittedAt: f.now()})
+	p.reviews = append(p.reviews, github.Review{ID: id, Author: author, State: state, Body: body, SubmittedAt: f.now(), CommitID: sha})
 	p.comments[id] = comments
+}
+
+// mergeAt records the PR as merged, with its final head and merge
+// commit.
+func (f *fakeGitHub) mergeAt(num int, head, merge string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.prs[key(repo, num)]
+	p.Open, p.Merged, p.HeadSHA, p.MergeCommitSHA = false, true, head, merge
 }
 
 // GitHub interface.
@@ -466,6 +473,77 @@ func (w *fakeWorkspace) PrepareDev(context.Context, config.Repo, int, string) (w
 
 func (w *fakeWorkspace) PrepareBranch(context.Context, config.Repo, int, string, int, string) (workspace.Dirs, error) {
 	return workspace.Dirs{}, errNoGit
+}
+
+func (w *fakeWorkspace) PrepareAt(context.Context, config.Repo, int, string) (workspace.Dirs, error) {
+	return workspace.Dirs{}, errNoGit
+}
+
+// fakeDocker is a docker Runner that records every call. fail maps a
+// subcommand to the output it fails with; down makes every call fail, as
+// when the daemon is unreachable.
+type fakeDocker struct {
+	mu    sync.Mutex
+	calls [][]string
+	ps    string
+	fail  map[string]string
+	down  int // the next down calls fail
+}
+
+func (d *fakeDocker) Run(_ context.Context, args ...string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, slices.Clone(args))
+	if d.down > 0 {
+		d.down--
+		return "Cannot connect to the Docker daemon", errors.New("exit status 1")
+	}
+	if out, ok := d.fail[args[0]]; ok {
+		return out, errors.New("exit status 1")
+	}
+	if args[0] == "ps" {
+		return d.ps, nil
+	}
+	return "", nil
+}
+
+// calledWith returns the calls of a docker subcommand.
+func (d *fakeDocker) calledWith(sub string) [][]string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out [][]string
+	for _, c := range d.calls {
+		if c[0] == sub {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// subcommands lists the docker subcommands called, in order.
+func (d *fakeDocker) subcommands() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, c := range d.calls {
+		out = append(out, c[0])
+	}
+	return out
+}
+
+// fakeProbe answers every smoke check with status, or with err.
+type fakeProbe struct {
+	mu     sync.Mutex
+	status int
+	err    error
+	urls   []string
+}
+
+func (p *fakeProbe) probe(_ context.Context, url string) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.urls = append(p.urls, url)
+	return p.status, p.err
 }
 
 func (w *fakeWorkspace) Snapshot(context.Context, config.Repo, int, string, string) (string, string, error) {

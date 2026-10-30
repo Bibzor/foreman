@@ -60,6 +60,8 @@ func limitCounter(reason string) (string, func(*store.Issue)) {
 		return "needs_info_rounds", func(is *store.Issue) { is.NeedsInfoRounds = 0 }
 	case reason == reasonRevisionLimit:
 		return "revision_rounds", func(is *store.Issue) { is.RevisionRounds = 0 }
+	case reason == reasonAcceptanceLimit:
+		return "acceptance_rounds", func(is *store.Issue) { is.AcceptanceRounds = 0 }
 	case strings.HasPrefix(reason, reasonPrepPrefix):
 		return "prep_failures", nil
 	}
