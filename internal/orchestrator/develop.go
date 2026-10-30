@@ -31,8 +31,16 @@ const (
 	maxNotes   = 10000
 )
 
-// Branch is the branch foreman develops an issue on.
-func Branch(number int) string { return "foreman/" + strconv.Itoa(number) }
+// Branch is the branch foreman develops an issue on: foreman/<n>, then
+// foreman/<n>-r<k> for the development restarted after the k-th
+// acceptance-ko, from the default branch that holds the merged work.
+func Branch(is store.Issue) string {
+	b := "foreman/" + strconv.Itoa(is.Number)
+	if is.AcceptanceRounds > 0 {
+		b += "-r" + strconv.Itoa(is.AcceptanceRounds)
+	}
+	return b
+}
 
 // queued starts development when fewer than wip_limit issues, across all
 // repositories, are in development or in review. Otherwise it says why
@@ -55,7 +63,7 @@ func (e *Engine) queued(ctx context.Context, c *Case) (*Transition, error) {
 	return &Transition{
 		To:      store.InProgress,
 		Reason:  "development started",
-		Comment: fmt.Sprintf("**In progress.** Development started on the branch `%s`.", Branch(c.Issue.Number)),
+		Comment: fmt.Sprintf("**In progress.** Development started on the branch `%s`.", Branch(c.Issue)),
 	}, nil
 }
 
@@ -99,7 +107,7 @@ func (e *Engine) inProgress(ctx context.Context, c *Case) (*Transition, error) {
 	if err != nil {
 		return nil, err
 	}
-	branch := Branch(c.Issue.Number)
+	branch := Branch(c.Issue)
 	var dirs workspace.Dirs
 	if t, err := e.prepare(ctx, c, func() (err error) {
 		dirs, err = e.Workspace.PrepareDev(ctx, c.Repo, c.Issue.Number, branch)
@@ -114,6 +122,9 @@ func (e *Engine) inProgress(ctx context.Context, c *Case) (*Transition, error) {
 	req := develop.Request{
 		Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Branch: branch, Project: p,
 		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria,
+	}
+	if c.Issue.AcceptanceRounds > 0 {
+		req.Feedback = &develop.Feedback{Author: c.Issue.AcceptanceFeedbackAuthor, Body: c.Issue.AcceptanceFeedback}
 	}
 	res, t, err := e.develop(ctx, c, req, "development")
 	if t != nil || err != nil {
@@ -152,6 +163,7 @@ func (e *Engine) inProgress(ctx context.Context, c *Case) (*Transition, error) {
 		Update: func(is *store.Issue) {
 			is.BaseBranch, is.BaseSHA, is.DevSHA, is.HeadSHA = dirs.BaseBranch, dirs.Base, tip, tip
 			is.PRNumber, is.RevisionRounds, is.LastReviewID, is.PrereviewDone = 0, 0, 0, false
+			is.MergeSHA = ""
 		},
 	}, nil
 }
@@ -277,6 +289,7 @@ func (e *Engine) inReview(ctx context.Context, c *Case) (*Transition, error) {
 			Reason: "pull request merged",
 			Comment: fmt.Sprintf("**Merged.** Pull request #%d was merged. "+
 				"This issue stays open until the change is accepted.", pr.Number),
+			Update: func(is *store.Issue) { is.MergeSHA = pr.MergeCommitSHA },
 		}, nil
 	case !pr.Open:
 		return blocked("pull request closed without merge",
@@ -293,7 +306,7 @@ func (e *Engine) inReview(ctx context.Context, c *Case) (*Transition, error) {
 func (e *Engine) branchWorkspace(ctx context.Context, c *Case, pr github.PullRequest) (workspace.Dirs, *Transition, error) {
 	var dirs workspace.Dirs
 	t, err := e.prepare(ctx, c, func() (err error) {
-		dirs, err = e.Workspace.PrepareBranch(ctx, c.Repo, c.Issue.Number, Branch(c.Issue.Number), pr.Commits+1, c.Issue.BaseSHA)
+		dirs, err = e.Workspace.PrepareBranch(ctx, c.Repo, c.Issue.Number, Branch(c.Issue), pr.Commits+1, c.Issue.BaseSHA)
 		return err
 	})
 	return dirs, t, err
@@ -431,7 +444,7 @@ func (e *Engine) revise(ctx context.Context, c *Case, pr github.PullRequest, rv 
 	for _, cm := range comments {
 		review.Comments = append(review.Comments, develop.ReviewComment{Path: cm.Path, Line: cm.Line, Body: cm.Body})
 	}
-	branch := Branch(c.Issue.Number)
+	branch := Branch(c.Issue)
 	req := develop.Request{
 		Workdir: dirs.Workdir, SkillsDir: dirs.SkillsDir, Branch: branch, Project: p,
 		Issue: snap, Summary: q.Summary, AcceptanceCriteria: q.AcceptanceCriteria, Review: review,

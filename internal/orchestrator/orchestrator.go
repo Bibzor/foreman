@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bibzor/foreman/internal/acceptance"
 	"github.com/Bibzor/foreman/internal/config"
 	"github.com/Bibzor/foreman/internal/develop"
 	"github.com/Bibzor/foreman/internal/github"
@@ -31,6 +32,9 @@ const (
 	LabelNoGo     = "no-go"
 	LabelHighRisk = "foreman:high-risk"
 	LabelRetry    = "retry"
+
+	LabelAcceptanceOK = "acceptance-ok"
+	LabelAcceptanceKO = "acceptance-ko"
 )
 
 // GitHub is what the engine needs from GitHub.
@@ -58,6 +62,7 @@ type GitHub interface {
 type Workspace interface {
 	Prepare(ctx context.Context, repo config.Repo, number int) (workspace.Dirs, error)
 	PrepareDev(ctx context.Context, repo config.Repo, number int, branch string) (workspace.Dirs, error)
+	PrepareAt(ctx context.Context, repo config.Repo, number int, sha string) (workspace.Dirs, error)
 	PrepareBranch(ctx context.Context, repo config.Repo, number int, branch string, depth int, need string) (workspace.Dirs, error)
 	Snapshot(ctx context.Context, repo config.Repo, number int, workdir, branch string) (dir, tip string, err error)
 	Push(ctx context.Context, repo config.Repo, dir, sha, branch string, force bool) error
@@ -97,6 +102,7 @@ type Deps struct {
 	Workspace Workspace
 	Agent     qualify.Agent
 	Developer develop.Agent
+	Deployer  acceptance.Deployer
 	Log       *slog.Logger
 	Now       func() time.Time
 }
@@ -128,6 +134,9 @@ func New(d Deps) *Engine {
 	e.Register(store.Queued, HandlerFunc(e.queued))
 	e.Register(store.InProgress, HandlerFunc(e.inProgress))
 	e.Register(store.InReview, HandlerFunc(e.inReview))
+	e.Register(store.Merged, HandlerFunc(e.merged))
+	e.Register(store.Deploying, HandlerFunc(e.deploying))
+	e.Register(store.InAcceptance, HandlerFunc(e.inAcceptance))
 	e.Register(store.Blocked, HandlerFunc(e.retry))
 	return e
 }
@@ -152,6 +161,11 @@ func Labels() []github.Label {
 		{Name: LabelGo, Color: "0e8a16", Description: "Approve (authorized users only)"},
 		{Name: LabelNoGo, Color: "b60205", Description: "Reject (authorized users only)"},
 		{Name: LabelRetry, Color: "fbca04", Description: "Run the blocked step again (authorized users only)"},
+		{Name: store.Deploying.Label(), Color: "5319e7", Description: "foreman: deploying to the acceptance environment"},
+		{Name: store.InAcceptance.Label(), Color: "d4c5f9", Description: "foreman: waiting for acceptance-ok / acceptance-ko"},
+		{Name: store.Done.Label(), Color: "0e8a16", Description: "foreman: accepted and done"},
+		{Name: LabelAcceptanceOK, Color: "0e8a16", Description: "Accept the deployed change (authorized users only)"},
+		{Name: LabelAcceptanceKO, Color: "b60205", Description: "Reject the deployed change, with a comment (authorized users only)"},
 	}
 }
 
@@ -295,8 +309,8 @@ func (e *Engine) process(ctx context.Context, repo config.Repo, is store.Issue) 
 			return err
 		}
 		is = c.Issue
-		if is.State == store.Closed {
-			return nil
+		if is.State == store.Closed || is.State == store.Done {
+			return nil // no longer tracked: a done issue is closed by foreman itself
 		}
 	}
 	return nil
@@ -511,10 +525,10 @@ func (c *Case) Snapshot(ctx context.Context) (qualify.Snapshot, error) {
 }
 
 // Authorized reports whether label is on the issue and its latest
-// "labeled" event is by an authorized user. For go, no-go and retry the
-// event must also be newer than the comment announcing the current state,
-// so a stale approval cannot carry over; both times come from GitHub's
-// clock.
+// "labeled" event is by an authorized user. For go, no-go, retry,
+// acceptance-ok and acceptance-ko the event must also be newer than the
+// comment announcing the current state, so a stale approval cannot carry
+// over; both times come from GitHub's clock.
 // A label added by anyone else is ignored, and the bot says so once per
 // labeling event.
 func (c *Case) Authorized(ctx context.Context, label string) (bool, error) {
