@@ -16,8 +16,11 @@ type PullRequest struct {
 	Open    bool
 	Merged  bool
 	Head    string // branch name
-	Body    string
-	Commits int
+	HeadSHA string // the head commit, the final one once merged
+	// MergeCommitSHA is the commit the merge made on the base branch.
+	MergeCommitSHA string
+	Body           string
+	Commits        int
 }
 
 // Review is a pull request review.
@@ -27,6 +30,7 @@ type Review struct {
 	State       string // APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING
 	Body        string
 	SubmittedAt time.Time
+	CommitID    string // the head commit the review was made on
 }
 
 // ReviewComment is an inline comment of a review.
@@ -43,13 +47,19 @@ type apiPull struct {
 	Body   *string `json:"body"`
 	Head   struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"head"`
-	MergedAt *time.Time `json:"merged_at"`
-	Commits  int        `json:"commits"`
+	MergedAt       *time.Time `json:"merged_at"`
+	MergeCommitSHA *string    `json:"merge_commit_sha"`
+	Commits        int        `json:"commits"`
 }
 
 func (a apiPull) pull() PullRequest {
-	pr := PullRequest{Number: a.Number, Open: a.State == "open", Merged: a.Merged || a.MergedAt != nil, Head: a.Head.Ref, Commits: a.Commits}
+	pr := PullRequest{Number: a.Number, Open: a.State == "open", Merged: a.Merged || a.MergedAt != nil,
+		Head: a.Head.Ref, HeadSHA: a.Head.SHA, Commits: a.Commits}
+	if a.MergeCommitSHA != nil {
+		pr.MergeCommitSHA = *a.MergeCommitSHA
+	}
 	if a.Body != nil {
 		pr.Body = *a.Body
 	}
@@ -104,6 +114,7 @@ func (c *Client) Reviews(ctx context.Context, repo config.Repo, number int) ([]R
 		State       string    `json:"state"`
 		Body        string    `json:"body"`
 		SubmittedAt time.Time `json:"submitted_at"`
+		CommitID    string    `json:"commit_id"`
 	}](ctx, c, repo, repoPath(repo, "pulls", strconv.Itoa(number), "reviews"))
 	if err != nil {
 		return nil, err
@@ -113,7 +124,7 @@ func (c *Client) Reviews(ctx context.Context, repo config.Repo, number int) ([]R
 		if r.User == nil {
 			continue // deleted account
 		}
-		out = append(out, Review{ID: r.ID, Author: r.User.Login, State: r.State, Body: r.Body, SubmittedAt: r.SubmittedAt})
+		out = append(out, Review{ID: r.ID, Author: r.User.Login, State: r.State, Body: r.Body, SubmittedAt: r.SubmittedAt, CommitID: r.CommitID})
 	}
 	return out, nil
 }

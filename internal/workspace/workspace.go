@@ -153,6 +153,40 @@ func (w *Workspace) PrepareBranch(ctx context.Context, repo config.Repo, number 
 	return d, nil
 }
 
+// PrepareAt prepares a workspace at commit sha of the default branch,
+// such as a merge commit: a fresh clone of the default branch, then sha
+// fetched and checked out, detached. ProjectFile and Base are those of
+// sha.
+func (w *Workspace) PrepareAt(ctx context.Context, repo config.Repo, number int, sha string) (Dirs, error) {
+	d, err := w.Prepare(ctx, repo, number)
+	if err != nil {
+		return Dirs{}, err
+	}
+	if d.Base != sha {
+		env, secrets, err := w.auth(ctx, repo)
+		if err != nil {
+			return Dirs{}, err
+		}
+		if _, err := gitOut(ctx, d.Workdir, env, secrets, "fetch", "-q", "--no-tags", "--depth", "1", "origin", sha); err != nil {
+			return Dirs{}, err
+		}
+		if err := scanForSecrets(filepath.Join(d.Workdir, ".git"), secrets); err != nil {
+			_ = os.RemoveAll(d.Workdir) // the credential must not stay on disk
+			return Dirs{}, err
+		}
+		if _, err := Git(ctx, d.Workdir, "checkout", "-q", "--detach", sha); err != nil {
+			return Dirs{}, err
+		}
+		if d.Base, err = Git(ctx, d.Workdir, "rev-parse", "HEAD"); err != nil {
+			return Dirs{}, err
+		}
+		if d.ProjectFile, err = projectFile(ctx, d.Workdir); err != nil {
+			return Dirs{}, err
+		}
+	}
+	return d, nil
+}
+
 // Snapshot clones branch from an agent's workdir into
 // data_dir/check/<owner>/<repo>/<issue>, a directory foreman owns, and
 // returns it with the branch tip. Only committed history crosses over,
