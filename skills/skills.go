@@ -10,11 +10,11 @@ import "embed"
 
 // PackVersion is the version of the skills pack (semver). Projects pin it
 // as skills_version in their .foreman.yml.
-const PackVersion = "0.1.0"
+const PackVersion = "0.2.0"
 
 // PackSHA256 is the hash of the pack at PackVersion, as computed by
 // PackHash. Update it with PackVersion.
-const PackSHA256 = "96fd5bee2126c75c3f5847fe23ccc61329c8d29e45714bf7a123956b212776be"
+const PackSHA256 = "c5ba01911381a309aecd17c47305ffb64375d2935293fa6ef541a06370029bdb"
 
 // FS holds every skill as <name>/SKILL.md.
 //

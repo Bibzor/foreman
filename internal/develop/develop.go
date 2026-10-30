@@ -101,6 +101,11 @@ type PreReviewRequest struct {
 	Issue              qualify.Snapshot
 	AcceptanceCriteria []string
 	Diff               string // the PR diff, written by an agent: untrusted
+	// PRBody is the PR description (the plan, with "Files to change") and
+	// Commits the commits of the PR with the files each touches, computed
+	// by foreman with git. Both are written by an agent: untrusted.
+	PRBody  string
+	Commits []CommitInfo
 }
 
 // Agent develops issues and pre-reviews the result. Implementations

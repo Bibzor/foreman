@@ -36,8 +36,8 @@ func invisible(r rune) bool { return hidden(r) || unicode.Is(unicode.Cf, r) }
 
 var (
 	b64Run  = regexp.MustCompile(`[A-Za-z0-9+/_-]{60,}={0,2}`)
-	tagName = regexp.MustCompile(`(?i)untrusted_(issue|review|diff)`)
-	tagLike = regexp.MustCompile(`(?i)<[\s/]*untrusted_(issue|review|diff)[^<>]*>`)
+	tagName = regexp.MustCompile(`(?i)untrusted_(issue|review|diff|pr_body|commits|feedback)`)
+	tagLike = regexp.MustCompile(`(?i)<[\s/]*untrusted_(issue|review|diff|pr_body|commits|feedback)[^<>]*>`)
 )
 
 // minB64Run is the shortest piece between slashes counted as encoded.
@@ -129,7 +129,8 @@ func MakeVisible(s string) string {
 }
 
 // Neutralize makes sure s cannot open or close an <untrusted_issue>,
-// <untrusted_review> or <untrusted_diff> block: tag-like sequences are
+// <untrusted_review>, <untrusted_diff>, <untrusted_pr_body>,
+// <untrusted_commits> or <untrusted_feedback> block: tag-like sequences are
 // replaced, then any remaining occurrence of a name, in any case, is
 // renamed. Run it after MakeVisible, so a
 // name split by invisible characters is already broken up visibly.
