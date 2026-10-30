@@ -32,6 +32,27 @@ type Config struct {
 	ProtectedPaths []string
 	TestPaths      []string
 	MaxDiffLines   int
+	// Acceptance is the acceptance environment, nil when the project has
+	// none.
+	Acceptance *Acceptance
+}
+
+// Acceptance is the acceptance environment foreman deploys a merged
+// change to. foreman builds the deployment commands itself from these
+// values: none of them is a command.
+type Acceptance struct {
+	Dockerfile    string // relative to the repository root
+	BuildArgs     map[string]string
+	ContainerPort int
+	HostPort      int // bound to 127.0.0.1 only
+	Env           map[string]string
+	Smoke         []Smoke
+}
+
+// Smoke is a smoke check: GET Path must answer Status.
+type Smoke struct {
+	Path   string
+	Status int
 }
 
 // Command is a command run as argv.
@@ -58,6 +79,17 @@ type file struct {
 	ProtectedPaths []string `yaml:"protected_paths"`
 	TestPaths      []string `yaml:"test_paths"`
 	MaxDiffLines   int      `yaml:"max_diff_lines"`
+	Acceptance     *struct {
+		Dockerfile    string            `yaml:"dockerfile"`
+		BuildArgs     map[string]string `yaml:"build_args"`
+		ContainerPort int               `yaml:"container_port"`
+		HostPort      int               `yaml:"host_port"`
+		Env           map[string]string `yaml:"env"`
+		Smoke         []struct {
+			Path   string `yaml:"path"`
+			Status int    `yaml:"status"`
+		} `yaml:"smoke"`
+	} `yaml:"acceptance"`
 }
 
 // ErrMissing means the repository has no .foreman.yml.
@@ -131,6 +163,43 @@ func Parse(b []byte, packVersion string) (Config, error) {
 	if f.MaxDiffLines <= 0 {
 		errs = append(errs, errors.New("max_diff_lines must be greater than 0"))
 	}
+	if a := f.Acceptance; a != nil {
+		acc := &Acceptance{Dockerfile: a.Dockerfile, ContainerPort: a.ContainerPort, HostPort: a.HostPort}
+		if acc.Dockerfile == "" {
+			acc.Dockerfile = "Dockerfile"
+		}
+		if clean, err := relativeFile(acc.Dockerfile); err != nil {
+			errs = append(errs, fmt.Errorf("acceptance.dockerfile: %w", err))
+		} else {
+			acc.Dockerfile = clean
+		}
+		var err error
+		if acc.BuildArgs, err = variables("acceptance.build_args", a.BuildArgs); err != nil {
+			errs = append(errs, err)
+		}
+		if acc.Env, err = variables("acceptance.env", a.Env); err != nil {
+			errs = append(errs, err)
+		}
+		if a.ContainerPort < 1 || a.ContainerPort > 65535 {
+			errs = append(errs, errors.New("acceptance.container_port must be between 1 and 65535"))
+		}
+		if a.HostPort < 1024 || a.HostPort > 65535 {
+			errs = append(errs, errors.New("acceptance.host_port must be between 1024 and 65535"))
+		}
+		if len(a.Smoke) == 0 || len(a.Smoke) > maxSmoke {
+			errs = append(errs, fmt.Errorf("acceptance.smoke needs 1 to %d checks", maxSmoke))
+		}
+		for i, s := range a.Smoke {
+			if !smokePath.MatchString(s.Path) {
+				errs = append(errs, fmt.Errorf("acceptance.smoke[%d].path: %q must start with / and have no space or control character", i, s.Path))
+			}
+			if s.Status < 100 || s.Status > 599 {
+				errs = append(errs, fmt.Errorf("acceptance.smoke[%d].status: %d is not an HTTP status", i, s.Status))
+			}
+			acc.Smoke = append(acc.Smoke, Smoke{Path: s.Path, Status: s.Status})
+		}
+		c.Acceptance = acc
+	}
 	if err := errors.Join(errs...); err != nil {
 		return Config{}, fmt.Errorf("invalid %s: %w", File, err)
 	}
@@ -170,6 +239,44 @@ func protectedPath(p string) (string, error) {
 	}
 	if dir {
 		return clean + "/", nil
+	}
+	return clean, nil
+}
+
+const maxSmoke = 10
+
+var (
+	varName   = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
+	smokePath = regexp.MustCompile(`^/[^\s\x00-\x1f\x7f]*$`)
+)
+
+// variables validates environment variables or build arguments: names in
+// upper case, values on one line.
+func variables(field string, m map[string]string) (map[string]string, error) {
+	var errs []error
+	for k, v := range m {
+		if !varName.MatchString(k) {
+			errs = append(errs, fmt.Errorf("%s: name %q must match %s", field, k, varName))
+		}
+		if strings.ContainsAny(v, "\n\r\x00") {
+			errs = append(errs, fmt.Errorf("%s: the value of %s must be on one line", field, k))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// relativeFile accepts a clean relative path to a file inside the
+// repository.
+func relativeFile(p string) (string, error) {
+	if strings.HasPrefix(p, "/") || strings.HasSuffix(p, "/") || strings.ContainsAny(p, "\\*?[\n\r\x00") {
+		return "", fmt.Errorf("%q must be a relative path to a file, with no glob", p)
+	}
+	clean := path.Clean(p)
+	if clean != p || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("%q must be a clean relative path inside the repository", p)
 	}
 	return clean, nil
 }

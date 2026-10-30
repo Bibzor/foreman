@@ -29,18 +29,21 @@ type State string
 
 // States.
 const (
-	None        State = "" // not tracked yet
-	Qualifying  State = "qualifying"
-	NeedsInfo   State = "needs-info"
-	AwaitingGo  State = "awaiting-go"
-	Queued      State = "queued"
-	Blocked     State = "blocked"
-	Suspect     State = "suspect"
-	InProgress  State = "in-progress"
-	InReview    State = "in-review"
-	Merged      State = "merged"
-	Closed      State = "closed"
-	labelPrefix       = "foreman:"
+	None         State = "" // not tracked yet
+	Qualifying   State = "qualifying"
+	NeedsInfo    State = "needs-info"
+	AwaitingGo   State = "awaiting-go"
+	Queued       State = "queued"
+	Blocked      State = "blocked"
+	Suspect      State = "suspect"
+	InProgress   State = "in-progress"
+	InReview     State = "in-review"
+	Merged       State = "merged"
+	Deploying    State = "deploying"
+	InAcceptance State = "in-acceptance"
+	Done         State = "done" // accepted, the issue closed: no longer tracked
+	Closed       State = "closed"
+	labelPrefix        = "foreman:"
 )
 
 // Label returns the GitHub label mirroring s, or "" for closed.
@@ -89,6 +92,15 @@ type Issue struct {
 	// LastReviewID is the newest PR review already handled.
 	LastReviewID  int64
 	PrereviewDone bool
+	// MergeSHA is the merge commit of the PR, the commit acceptance
+	// deploys.
+	MergeSHA string
+	// AcceptanceRounds counts the developments restarted after an
+	// acceptance-ko; AcceptanceFeedback and AcceptanceFeedbackAuthor are
+	// the comment explaining the last one. The feedback is untrusted.
+	AcceptanceRounds         int
+	AcceptanceFeedback       string
+	AcceptanceFeedbackAuthor string
 }
 
 // Transition is a history entry.
@@ -213,6 +225,10 @@ var migrations = []string{
 	ALTER TABLE outbox ADD COLUMN open_pr TEXT NOT NULL DEFAULT '';
 	ALTER TABLE outbox ADD COLUMN pr INTEGER NOT NULL DEFAULT 0;
 	ALTER TABLE outbox ADD COLUMN add_labels TEXT NOT NULL DEFAULT '';`,
+	`ALTER TABLE issues ADD COLUMN merge_sha TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN acceptance_rounds INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE issues ADD COLUMN acceptance_feedback TEXT NOT NULL DEFAULT '';
+	ALTER TABLE issues ADD COLUMN acceptance_feedback_author TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -248,13 +264,15 @@ func (s *Store) tx(ctx context.Context, f func(*sql.Tx) error) error {
 }
 
 const issueCols = `repo, number, state, author, needs_info_rounds, state_entered_at, qualification, snapshot, snapshot_sha256,
-	prep_failures, state_outbox_id, base_branch, base_sha, dev_sha, head_sha, pr_number, revision_rounds, last_review_id, prereview_done`
+	prep_failures, state_outbox_id, base_branch, base_sha, dev_sha, head_sha, pr_number, revision_rounds, last_review_id, prereview_done,
+	merge_sha, acceptance_rounds, acceptance_feedback, acceptance_feedback_author`
 
 func scanIssue(row interface{ Scan(...any) error }) (Issue, error) {
 	var is Issue
 	var at string
 	err := row.Scan(&is.Repo, &is.Number, &is.State, &is.Author, &is.NeedsInfoRounds, &at, &is.Qualification, &is.Snapshot, &is.SnapshotSHA,
-		&is.PrepFailures, &is.StateOutboxID, &is.BaseBranch, &is.BaseSHA, &is.DevSHA, &is.HeadSHA, &is.PRNumber, &is.RevisionRounds, &is.LastReviewID, &is.PrereviewDone)
+		&is.PrepFailures, &is.StateOutboxID, &is.BaseBranch, &is.BaseSHA, &is.DevSHA, &is.HeadSHA, &is.PRNumber, &is.RevisionRounds, &is.LastReviewID, &is.PrereviewDone,
+		&is.MergeSHA, &is.AcceptanceRounds, &is.AcceptanceFeedback, &is.AcceptanceFeedbackAuthor)
 	if err != nil {
 		return Issue{}, err
 	}
@@ -271,9 +289,11 @@ func (s *Store) Get(ctx context.Context, repo string, number int) (is Issue, ok 
 	return is, err == nil, err
 }
 
-// Tracked returns the tracked issues of repo that are not closed, by number.
+// Tracked returns the tracked issues of repo that are neither closed nor
+// done, by number.
 func (s *Store) Tracked(ctx context.Context, repo string) ([]Issue, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+issueCols+` FROM issues WHERE repo = ? AND state != ? ORDER BY number`, repo, Closed)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+issueCols+` FROM issues WHERE repo = ? AND state NOT IN (?, ?) ORDER BY number`,
+		repo, Closed, Done)
 	if err != nil {
 		return nil, err
 	}
@@ -331,17 +351,20 @@ func (s *Store) Transition(ctx context.Context, from State, next Issue, reason s
 			return err
 		}
 		next.StateOutboxID = id
-		_, err = tx.ExecContext(ctx, `INSERT INTO issues (`+issueCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		_, err = tx.ExecContext(ctx, `INSERT INTO issues (`+issueCols+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (repo, number) DO UPDATE SET state = excluded.state, author = excluded.author,
 			needs_info_rounds = excluded.needs_info_rounds, state_entered_at = excluded.state_entered_at,
 			qualification = excluded.qualification, snapshot = excluded.snapshot, snapshot_sha256 = excluded.snapshot_sha256,
 			prep_failures = excluded.prep_failures, state_outbox_id = excluded.state_outbox_id,
 			base_branch = excluded.base_branch, base_sha = excluded.base_sha, dev_sha = excluded.dev_sha, head_sha = excluded.head_sha,
 			pr_number = excluded.pr_number, revision_rounds = excluded.revision_rounds,
-			last_review_id = excluded.last_review_id, prereview_done = excluded.prereview_done`,
+			last_review_id = excluded.last_review_id, prereview_done = excluded.prereview_done,
+			merge_sha = excluded.merge_sha, acceptance_rounds = excluded.acceptance_rounds,
+			acceptance_feedback = excluded.acceptance_feedback, acceptance_feedback_author = excluded.acceptance_feedback_author`,
 			next.Repo, next.Number, next.State, next.Author, next.NeedsInfoRounds, at, next.Qualification, next.Snapshot, next.SnapshotSHA,
 			next.PrepFailures, next.StateOutboxID, next.BaseBranch, next.BaseSHA, next.DevSHA, next.HeadSHA,
-			next.PRNumber, next.RevisionRounds, next.LastReviewID, next.PrereviewDone)
+			next.PRNumber, next.RevisionRounds, next.LastReviewID, next.PrereviewDone,
+			next.MergeSHA, next.AcceptanceRounds, next.AcceptanceFeedback, next.AcceptanceFeedbackAuthor)
 		return err
 	})
 	if err != nil {
