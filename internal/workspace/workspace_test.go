@@ -243,11 +243,13 @@ func TestPrepareAt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tip := run(t, src, "rev-parse", "HEAD")
 	if got := run(t, d.Workdir, "rev-parse", "HEAD"); got != merge || d.Base != merge {
 		t.Fatalf("HEAD = %s, Base = %s, want the merge commit %s", got, d.Base, merge)
 	}
-	if string(d.ProjectFile) != "at the merge\n" || d.BaseBranch != "trunk" {
-		t.Fatalf("dirs = %+v, want .foreman.yml of the merge commit", d)
+	// The code is the merge commit's; the configuration is the tip's.
+	if string(d.ProjectFile) != "later\n" || d.ProjectSHA != tip || d.BaseBranch != "trunk" {
+		t.Fatalf("dirs = %+v, want .foreman.yml of the default branch's tip %s", d, tip)
 	}
 	if b, _ := os.ReadFile(filepath.Join(d.Workdir, "app.go")); string(b) != "package app\n" {
 		t.Fatalf("app.go = %q", b)
@@ -256,8 +258,7 @@ func TestPrepareAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The tip itself needs no fetch.
-	tip := run(t, src, "rev-parse", "HEAD")
-	if d, err := w.PrepareAt(context.Background(), repoID, 7, tip); err != nil || d.Base != tip || string(d.ProjectFile) != "later\n" {
+	if d, err := w.PrepareAt(context.Background(), repoID, 7, tip); err != nil || d.Base != tip || d.ProjectSHA != tip {
 		t.Fatalf("at the tip: %+v %v", d, err)
 	}
 }

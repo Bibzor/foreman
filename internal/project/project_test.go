@@ -166,6 +166,27 @@ func TestParseAcceptanceErrors(t *testing.T) {
 	}
 }
 
+func TestParseNoPack(t *testing.T) {
+	old := strings.Replace(valid, "skills_version: 0.1.0", "skills_version: 0.0.9", 1)
+	if _, err := project.Parse([]byte(old), pack); err == nil {
+		t.Fatal("Parse accepted another pack version")
+	}
+	c, err := project.ParseNoPack([]byte(old + acceptance))
+	if err != nil || c.SkillsVersion != "0.0.9" || c.Acceptance == nil {
+		t.Fatalf("ParseNoPack = %+v %v", c, err)
+	}
+	// Everything else is still checked.
+	for _, bad := range []string{
+		strings.Replace(old, "skills_version: 0.0.9\n", "", 1),
+		strings.Replace(old+acceptance, "host_port: 18080", "host_port: 80", 1),
+		old + "shell: bash\n",
+	} {
+		if _, err := project.ParseNoPack([]byte(bad)); err == nil {
+			t.Errorf("ParseNoPack accepted:\n%s", bad)
+		}
+	}
+}
+
 func TestParseMissing(t *testing.T) {
 	if _, err := project.Parse(nil, pack); !errors.Is(err, project.ErrMissing) {
 		t.Fatalf("err = %v", err)
