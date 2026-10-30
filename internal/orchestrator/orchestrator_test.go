@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bibzor/foreman/internal/acceptance/docker"
 	"github.com/Bibzor/foreman/internal/config"
 	"github.com/Bibzor/foreman/internal/orchestrator"
 	"github.com/Bibzor/foreman/internal/store"
@@ -40,6 +41,10 @@ type fixture struct {
 	// skew is added to foreman's clock only, not to GitHub's.
 	skew time.Duration
 	wip  int // wip_limit; 0 is the default
+	// docker and probe stand for the docker CLI and the HTTP smoke
+	// checks under the real Docker deployer.
+	docker *fakeDocker
+	probe  *fakeProbe
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -54,7 +59,8 @@ func newFixture(t *testing.T) *fixture {
 		clock = clock.Add(time.Second)
 		return clock
 	}
-	fx := &fixture{t: t, dir: t.TempDir(), gh: newFakeGitHub(now), agent: &fakeAgent{}, now: now}
+	fx := &fixture{t: t, dir: t.TempDir(), gh: newFakeGitHub(now), agent: &fakeAgent{}, now: now,
+		docker: &fakeDocker{}, probe: &fakeProbe{status: 200}}
 	fx.ws = &fakeWorkspace{dir: fx.dir}
 	fx.restart()
 	if err := fx.engine.Start(context.Background()); err != nil {
@@ -90,7 +96,9 @@ func (fx *fixture) restart() {
 		Workspace: ws,
 		Agent:     fx.agent,
 		Developer: fx.agent,
-		Now:       func() time.Time { return fx.now().Add(fx.skew) },
+		Deployer: &docker.Deployer{Runner: fx.docker, Probe: fx.probe.probe,
+			SmokeTimeout: 50 * time.Millisecond, Interval: time.Millisecond},
+		Now: func() time.Time { return fx.now().Add(fx.skew) },
 	})
 	if fx.workspace == nil {
 		// Qualification tests stop at queued.

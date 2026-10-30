@@ -62,6 +62,16 @@ type Request struct {
 	// Review is nil for development, the review to address for a
 	// revision.
 	Review *Review
+	// Feedback is set when a previous implementation was merged and
+	// rejected at acceptance: this development addresses it.
+	Feedback *Feedback
+}
+
+// Feedback is the comment explaining why a merged change was rejected at
+// acceptance. It is untrusted.
+type Feedback struct {
+	Author string
+	Body   string
 }
 
 // Severities of a pre-review finding.

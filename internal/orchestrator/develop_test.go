@@ -106,6 +106,7 @@ type devSetup struct {
 	test, lint  string
 	pack        string
 	projectFile *string // nil: defaultProject; "": no file
+	acceptance  string  // appended to defaultProject
 }
 
 // newDevFixture is a fixture with a real workspace over a local bare
@@ -121,7 +122,8 @@ func newDevFixture(t *testing.T, opts ...func(*devSetup)) *fixture {
 	gitRun(t, src, "init", "-q", "-b", "main")
 	files := map[string]string{
 		"AGENTS.md": "# demo\n", "main.go": "package main\n", "main_test.go": "package main\n",
-		".foreman.yml": fmt.Sprintf(defaultProject, setup.pack, setup.test, setup.lint),
+		"Dockerfile":   "FROM scratch\n",
+		".foreman.yml": fmt.Sprintf(defaultProject, setup.pack, setup.test, setup.lint) + setup.acceptance,
 	}
 	if setup.projectFile != nil {
 		files[".foreman.yml"] = *setup.projectFile
@@ -327,8 +329,8 @@ func TestWIPLimit(t *testing.T) {
 	}
 
 	// A merge frees a slot.
-	fx.gh.mergePR(fx.issueRow().PRNumber)
-	fx.agent.pushDev(devAnswer{work: goodWork(t), res: done()})
+	fx.approveAndMerge(fx.issueRow().PRNumber, "foreman/7")
+	fx.agent.pushDev(devAnswer{work: roundWork(t, 9), res: done()}) // main holds #7's files now
 	fx.agent.pushPre(lowFindings())
 	fx.tick()
 	if is, _, _ := fx.db.Get(context.Background(), repo.String(), 9); is.State != store.InReview {
@@ -645,13 +647,24 @@ func TestRevisionLimit(t *testing.T) {
 func TestPullRequestOutcome(t *testing.T) {
 	t.Run("merged", func(t *testing.T) {
 		fx, pr := inReview(t)
-		fx.gh.mergePR(pr)
+		_, merge := fx.approveAndMerge(pr, "foreman/7")
 		fx.tick()
-		if s := fx.state(); s != store.Merged {
+		// No acceptance section: straight on to acceptance by a human.
+		if s := fx.state(); s != store.InAcceptance {
 			t.Fatalf("state = %q", s)
 		}
-		if !fx.gh.issue().Open || !fx.gh.issue().HasLabel("foreman:merged") {
+		if !fx.gh.issue().Open || !fx.gh.issue().HasLabel("foreman:in-acceptance") {
 			t.Fatalf("issue = %+v: it stays open until acceptance", fx.gh.issue())
+		}
+		if is := fx.issueRow(); is.MergeSHA != merge {
+			t.Fatalf("merge sha = %q, want %q", is.MergeSHA, merge)
+		}
+		var merged bool
+		for _, c := range fx.gh.botComments() {
+			merged = merged || strings.Contains(c, "**Merged.** Pull request #101 was merged.")
+		}
+		if !merged {
+			t.Fatal("no merged comment")
 		}
 	})
 	t.Run("closed unmerged", func(t *testing.T) {

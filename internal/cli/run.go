@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/Bibzor/foreman/internal/acceptance/docker"
 	"github.com/Bibzor/foreman/internal/claudecode"
 	"github.com/Bibzor/foreman/internal/config"
 	"github.com/Bibzor/foreman/internal/github"
@@ -69,7 +70,8 @@ func run(args []string, stderr io.Writer) error {
 			Claude:  &claudecode.Claude{},
 			GitName: "foreman", GitEmail: "foreman@users.noreply.github.com",
 		},
-		Log: log,
+		Deployer: &docker.Deployer{Runner: docker.Exec{}, Probe: docker.HTTPProbe},
+		Log:      log,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
