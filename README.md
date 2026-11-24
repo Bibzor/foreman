@@ -53,8 +53,10 @@ interface is the next step.
 
 ## Quick start
 
-Requirements: Go, Docker, Claude Code and a GitHub App installed on the
-target repositories.
+Requirements: Go 1.27+, Docker, Claude Code and a GitHub App installed on the
+target repositories. Both configuration files are described below:
+[Configuration](#configuration) and
+[Project configuration](#project-configuration-foremanyml).
 
 ```sh
 make build                       # bin/foreman
