@@ -1,11 +1,71 @@
 # foreman
 
-A single Go binary that orchestrates AI coding agents over GitHub issues.
-It takes an issue from opt-in to a go / no-go decision, has the agent
-develop it into a pull request ready for human review, follows that
-review until the PR is merged, deploys the merged commit to an
-acceptance environment and closes the issue once an authorized user
-accepts the change. It also ships the skills pack those agents use.
+> Industrialising AI coding agents with humans in the loop: from a GitHub
+> issue to an accepted change, every step gated, sandboxed and auditable.
+
+## Why
+
+Coding agents write code fast, but they cannot be trusted by default:
+they misread requirements, skip tests, and read text that anyone can
+write (issues, reviews, diffs). foreman puts them inside a delivery
+process instead of beside it. Agents do the work; humans keep every
+decision that matters; foreman verifies everything itself.
+
+## How it works
+
+```mermaid
+flowchart LR
+    I[GitHub issue] -->|opt-in label| Q[Agent qualifies:<br/>summary, acceptance criteria]
+    Q -->|human go / no-go| D[Agent develops:<br/>plan, tests first, code]
+    D -->|foreman re-checks the branch| PR[Pull request]
+    PR -->|agent pre-review<br/>+ human review| M[Human merge]
+    M --> A[Deploy to acceptance<br/>+ smoke checks]
+    A -->|human acceptance-ok| Done[Issue closed]
+    A -->|acceptance-ko + feedback| D
+```
+
+## Design principles
+
+- **Humans decide, agents execute.** Go / no-go, merge and acceptance
+  are human decisions. An approval is bound to a sha256 of the content
+  it approved: if the issue changes, it is qualified again.
+- **Untrusted by default.** Issue text, reviews, diffs and feedback reach
+  the agent as delimited untrusted input. Prompt-injection markers
+  (hidden characters, HTML comments, encoded blobs) are detected in Go
+  and force the issue to `suspect`, whatever the agent says.
+- **Verify, don't trust.** foreman re-checks the agent's branch in its
+  own clone: tests committed before code, protected paths untouched,
+  diff size limit, tests and lint passing.
+- **Least privilege.** Every project command runs in a throwaway Docker
+  container: no network, read-only root, no capabilities, non-root,
+  resource limits. The agent's tools are restricted, and GitHub tokens
+  never reach it.
+- **Reliable side effects.** A state machine stored in SQLite, with an
+  outbox for GitHub calls: a restart replays what was pending without
+  duplicate comments or pull requests.
+
+## Status
+
+Personal proof of concept, written in Go (about 16,000 lines, half of
+them tests, run with `go test -race` in CI). Supported agent: Claude
+Code. Deployment backend: Docker; a Kubernetes backend behind the same
+interface is the next step.
+
+## Quick start
+
+Requirements: Go, Docker, Claude Code and a GitHub App installed on the
+target repositories.
+
+```sh
+make build                       # bin/foreman
+# write ~/.config/foreman/config.yml (see Configuration below)
+# commit a .foreman.yml at the root of each target repository
+bin/foreman run --once           # one polling cycle
+```
+
+---
+
+_The sections below are the full reference._
 
 ## Skills
 
@@ -18,16 +78,16 @@ A pull request that changes a skill bumps `PackVersion` and updates
 unchanged version. Projects pin the pack with `skills_version` in their
 `.foreman.yml`.
 
-| Skill | Purpose |
-|-------|---------|
-| foreman-qualify | Qualify an issue: summary, acceptance criteria or questions. |
-| foreman-plan | Write the plan as the PR description, one section per criterion. |
-| foreman-tdd | Write and commit failing tests before any production code. |
-| foreman-fix-loop | Fix failing tests; stop after 3 attempts with a report. |
-| foreman-review-guide | Append a review guide to the PR description. |
-| foreman-prereview | Strict review of a PR against its acceptance criteria. |
-| go-conventions | Go rules and commands. |
-| react-conventions | React rules and commands. |
+| Skill                | Purpose                                                          |
+| -------------------- | ---------------------------------------------------------------- |
+| foreman-qualify      | Qualify an issue: summary, acceptance criteria or questions.     |
+| foreman-plan         | Write the plan as the PR description, one section per criterion. |
+| foreman-tdd          | Write and commit failing tests before any production code.       |
+| foreman-fix-loop     | Fix failing tests; stop after 3 attempts with a report.          |
+| foreman-review-guide | Append a review guide to the PR description.                     |
+| foreman-prereview    | Strict review of a PR against its acceptance criteria.           |
+| go-conventions       | Go rules and commands.                                           |
+| react-conventions    | React rules and commands.                                        |
 
 Skills that read issue text treat it as untrusted data.
 
@@ -46,9 +106,9 @@ app_id: 123456
 private_key_path: ~/.config/foreman/app.pem
 repos: ["Bibzor/demo-api", "Bibzor/demo-web"]
 authorized_users: ["Bibzor"]
-poll_interval: 30s                 # default
-data_dir: ~/.local/share/foreman   # default
-wip_limit: 2                       # default: issues in development or review, all repos together
+poll_interval: 30s # default
+data_dir: ~/.local/share/foreman # default
+wip_limit: 2 # default: issues in development or review, all repos together
 ```
 
 foreman authenticates as a GitHub App: a JWT signed with the private key,
@@ -63,14 +123,14 @@ permissions: Issues (read and write), Contents (read and write, to push
 Each project commits `.foreman.yml` at the root of its default branch:
 
 ```yaml
-skills_version: 0.2.0          # must equal the skills pack foreman ships
-agent: claude                  # the only agent supported for now
+skills_version: 0.2.0 # must equal the skills pack foreman ships
+agent: claude # the only agent supported for now
 commands:
   test: make test
   lint: make lint
-  extra: [make vuln]           # optional: more commands the agent may run
+  extra: [make vuln] # optional: more commands the agent may run
 protected_paths: [.github/workflows/, AGENTS.md, .foreman.yml, go.mod, go.sum]
-test_paths: ["**/*_test.go"]   # globs; "**" matches any number of directories
+test_paths: ["**/*_test.go"] # globs; "**" matches any number of directories
 max_diff_lines: 400
 ```
 
@@ -93,22 +153,22 @@ command.
 
 ```yaml
 acceptance:
-  dockerfile: Dockerfile          # optional, default Dockerfile
-  build_args: {VITE_API_URL: "http://localhost:18080"}   # optional
+  dockerfile: Dockerfile # optional, default Dockerfile
+  build_args: { VITE_API_URL: "http://localhost:18080" } # optional
   container_port: 8080
-  host_port: 18080                # fixed per project
-  env: {ALLOWED_ORIGINS: "http://localhost:18081"}       # optional
+  host_port: 18080 # fixed per project
+  env: { ALLOWED_ORIGINS: "http://localhost:18081" } # optional
   smoke:
-    - {path: /healthz, status: 200}
+    - { path: /healthz, status: 200 }
 ```
 
-| Field | Rule |
-|-------|------|
-| `dockerfile` | A clean relative path to a file inside the repository: no leading `/`, no `..`, no glob. At deploy time it must be a regular file inside the clone once symlinks are resolved. |
-| `build_args`, `env` | Names match `^[A-Z_][A-Z0-9_]*$`; values are on one line (no newline, carriage return or NUL). They are committed, so they are not secrets. |
-| `container_port` | 1 to 65535, required. |
-| `host_port` | 1024 to 65535, required. Bound to `127.0.0.1` only. Give each project its own: a port already in use fails the run and blocks the issue. |
-| `smoke` | 1 to 10 checks. `path` starts with `/` and has no space or control character; `status` is an HTTP status (100 to 599). |
+| Field               | Rule                                                                                                                                                                           |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `dockerfile`        | A clean relative path to a file inside the repository: no leading `/`, no `..`, no glob. At deploy time it must be a regular file inside the clone once symlinks are resolved. |
+| `build_args`, `env` | Names match `^[A-Z_][A-Z0-9_]*$`; values are on one line (no newline, carriage return or NUL). They are committed, so they are not secrets.                                    |
+| `container_port`    | 1 to 65535, required.                                                                                                                                                          |
+| `host_port`         | 1024 to 65535, required. Bound to `127.0.0.1` only. Give each project its own: a port already in use fails the run and blocks the issue.                                       |
+| `smoke`             | 1 to 10 checks. `path` starts with `/` and has no space or control character; `status` is an HTTP status (100 to 599).                                                         |
 
 Unknown keys are refused, as everywhere in the file. Without an
 `acceptance` section, a merged change goes straight to `in-acceptance`
@@ -243,6 +303,7 @@ and so on. Any tracked issue closed by a human goes to `closed`.
   Then it pushes the branch and opens a pull request: the issue title,
   the plan and the review guide, and `Refs #<issue>`, never `Closes`, so
   the issue stays open until acceptance.
+
 - **in-review**: right after the PR opens, a separate Claude Code run, in
   a fresh session with read-only tools, runs `foreman-prereview` and posts
   its findings on the PR. It gets the acceptance criteria, the diff, the
@@ -367,7 +428,7 @@ error.
   hooks and MCP servers. The skills are loaded with `--plugin-dir` from a
   verified directory outside the clone. Qualification and pre-review get
   `Read, Grep, Glob, Skill`. Development gets `Read, Grep, Glob, Edit,
-  Write, Skill`, and `Bash` only for the project commands, verbatim, and
+Write, Skill`, and `Bash` only for the project commands, verbatim, and
   `git add`, `git commit`, `git status`, `git diff`, `git log`. No push,
   no `gh`, no web tools. Its git runs with no user configuration and no
   hooks.
